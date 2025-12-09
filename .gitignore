@@ -1,0 +1,31 @@
+node_modules/
+# Logs
+*.log
+bot-activity.log
+wc-debug.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Build / coverage
+dist/
+coverage/
+
+# PID files
+pids/
+*.pid
+
+# Ignore local npm debug files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
