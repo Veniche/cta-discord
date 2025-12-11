@@ -104,6 +104,26 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
 
     await member.roles.add(roleId);
 
+    // Grant an additional lifetime role if the purchased product name contains 'lifetime' (case-insensitive)
+    try {
+      const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
+      const hasLifetimeProduct = (found?.order?.line_items || []).some(li => typeof li.name === 'string' && /lifetime/i.test(li.name));
+      if (hasLifetimeProduct) {
+        if (!lifetimeRoleId) {
+          appendBotLog('WARN', 'LIFETIME_ROLE_ID not configured but order indicates lifetime product', { orderId: found.orderId });
+        } else {
+          try {
+            await member.roles.add(lifetimeRoleId);
+            appendBotLog('INFO', 'Granted lifetime role to member', { userId: discordUser.id, orderId: found.orderId, lifetimeRoleId });
+          } catch (lrErr) {
+            appendBotLog('ERROR', 'Failed to add lifetime role', { userId: discordUser.id, orderId: found.orderId, lifetimeRoleId, error: lrErr.message });
+          }
+        }
+      }
+    } catch (e) {
+      appendBotLog('WARN', 'Error while checking/granting lifetime role', { error: e.message });
+    }
+
     try {
       await woocommerce.updateOrderMemberData(found.orderId, [
         { key: 'activation_used', value: '1' },
