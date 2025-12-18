@@ -182,6 +182,8 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
         await member.roles.add(lifetimeRoleId);
 
         webinarRow.is_used = 'True';
+        webinarRow.discord_id = discordUser.id;
+        webinarRow.discord_username = discordUser.tag;
         writeWebinarCsv(webinarRows);
 
         appendBotLog('INFO', 'Webinar activation successful', {
