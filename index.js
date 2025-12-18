@@ -76,6 +76,65 @@ client.login(process.env.DISCORD_TOKEN);
 
 // Invite cache removed — using direct activation flow only
 
+// Webinar Implementation
+const WEBINAR_CSV_PATH = path.join(process.cwd(), 'webinar_final.csv');
+const WEBINAR_LOCK_PATH = WEBINAR_CSV_PATH + ".lock";
+
+function readWebinarCsv() {
+  if (!fs.existsSync(WEBINAR_CSV_PATH)) return [];
+  const raw = fs.readFileSync(WEBINAR_CSV_PATH, 'utf8').trim();
+  if (!raw) return [];
+
+  const [headerLine, ...lines] = raw.split('\n');
+  const headers = headerLine.split(',');
+
+  return lines.map(line => {
+    const values = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h.trim()] = (values[i] || '').trim();
+    });
+    return row;
+  });
+}
+
+function writeWebinarCsv(rows) {
+  if (!rows.length) return;
+
+  const headers = Object.keys(rows[0]);
+  const csv =
+    headers.join(',') + '\n' +
+    rows.map(r => headers.map(h => r[h] ?? '').join(',')).join('\n');
+
+  fs.writeFileSync(WEBINAR_CSV_PATH, csv, 'utf8');
+}
+
+// Lockfile
+const LOCK_RETRY_DELAY_MS = 100;
+const LOCK_TIMEOUT_MS = 10_000;
+
+async function acquireLock(lockPath) {
+  const start = Date.now();
+
+  while (true) {
+    try {
+      fs.writeFileSync(lockPath, process.pid.toString(), { flag: "wx" });
+      return;
+    } catch {
+      if (Date.now() - start > LOCK_TIMEOUT_MS) {
+        throw new Error("CSV lock timeout");
+      }
+      await new Promise(res => setTimeout(res, LOCK_RETRY_DELAY_MS));
+    }
+  }
+}
+
+function releaseLock(lockPath) {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {}
+}
+
 // --- Activation helper (shared by DM and modal flows) ---
 async function activateOrderForDiscordUser(uuid, discordUser) {
   // unified activation with attempt logging
@@ -83,6 +142,60 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
   let result = { success: false, code: 'UNKNOWN', orderId: null, error: null };
 
   try {
+    // ─────────────────────────────────────────────
+    // 1️⃣ CHECK WEBINAR CSV FIRST (LOCKED)
+    // ─────────────────────────────────────────────
+    await acquireLock(WEBINAR_LOCK_PATH);
+
+    try {
+      const webinarRows = readWebinarCsv();
+      const webinarRow = webinarRows.find(
+        r => r.activation_uuid === uuid
+      );
+
+      if (webinarRow) {
+        if (String(webinarRow.is_used).toLowerCase() === 'true') {
+          appendBotLog('INFO', 'Webinar activation already used', {
+            uuid,
+            email: webinarRow.email,
+            userId: discordUser.id
+          });
+          return { success: false, code: 'ALREADY_USED' };
+        }
+
+        const guild = await client.guilds.fetch(process.env.GUILD_ID);
+        const member = await guild.members.fetch(discordUser.id).catch(() => null);
+        if (!member) {
+          return { success: false, code: 'NOT_IN_GUILD' };
+        }
+
+        const memberRoleId = process.env.MEMBER_ROLE_ID;
+        const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
+        if (!memberRoleId || !lifetimeRoleId) {
+          return { success: false, code: 'NO_ROLE_CONFIG' };
+        }
+
+        await member.roles.add(memberRoleId);
+        await member.roles.add(lifetimeRoleId);
+
+        webinarRow.is_used = 'True';
+        writeWebinarCsv(webinarRows);
+
+        appendBotLog('INFO', 'Webinar activation successful', {
+          userId: discordUser.id,
+          uuid,
+          email: webinarRow.email
+        });
+
+        return { success: true, code: 'OK', orderId: 'WEBINAR' };
+      }
+    } finally {
+      releaseLock(WEBINAR_LOCK_PATH);
+    }
+
+    // ─────────────────────────────────────────────
+    // 2️⃣ FALL THROUGH TO WOO LOGIC (UNCHANGED)
+    // ─────────────────────────────────────────────
     const found = await woocommerce.findOrderByUUID(uuid);
     if (!found) {
       result = { success: false, code: 'NOT_FOUND' };
