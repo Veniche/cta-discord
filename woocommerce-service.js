@@ -45,15 +45,15 @@ export class WooCommerceService {
         for (const order of orders) {
           const metaData = order.meta_data || [];
 
+          const matching = metaData.find(data => data.key === uuidMetaKey && `${data.value}` === `${uuid}`);
+          if (!matching) continue;
+
           const isOldMeta = metaData.find(data => data.key === 'is_old');
           const isOldValue = isOldMeta && (isOldMeta.value === true || isOldMeta.value === 'true' || isOldMeta.value === 'True');
           if (isOldValue) {
             console.debug('Skipping old order:', order.id);
             return null; // stop searching entirely
           }
-
-          const matching = metaData.find(data => data.key === uuidMetaKey && `${data.value}` === `${uuid}`);
-          if (!matching) continue;
 
           // Ignore orders that are already claimed (have discord_id or activation_used)
           const claimed = metaData.some(d => d.key === 'discord_id' || d.key === 'activation_used');
