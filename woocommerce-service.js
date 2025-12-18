@@ -37,7 +37,6 @@ export class WooCommerceService {
       console.debug('WC findOrderByUUID -> searching for UUID:', uuid);
       appendWCLog({ event: 'findOrderByUUID.start', uuid, totalOrders });
 
-      outerLoop:
       for (let page = 1; page <= totalPages; page++) {
         const response = await this.api.get('orders', { per_page: 100, page });
         const orders = response.data || [];
@@ -50,7 +49,7 @@ export class WooCommerceService {
           const isOldValue = isOldMeta && (isOldMeta.value === true || isOldMeta.value === 'true' || isOldMeta.value === 'True');
           if (isOldValue) {
             console.debug('Skipping old order:', order.id);
-            break outerLoop; // stop searching entirely
+            return null; // stop searching entirely
           }
 
           const matching = metaData.find(data => data.key === uuidMetaKey && `${data.value}` === `${uuid}`);
@@ -60,7 +59,7 @@ export class WooCommerceService {
           const claimed = metaData.some(d => d.key === 'discord_id' || d.key === 'activation_used');
           if (claimed) {
             console.debug('Found matching UUID but order already claimed:', order.id);
-            break outerLoop; // stop searching entirely
+            return null; // stop searching entirely
           }
 
           console.debug('Found matching UUID on order:', order.id);
