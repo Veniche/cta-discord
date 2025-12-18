@@ -160,19 +160,22 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
             email: webinarRow.email,
             userId: discordUser.id
           });
-          return { success: false, code: 'ALREADY_USED' };
+          result = { success: false, code: 'ALREADY_USED', orderId: 'WEBINAR' };
+          return result;
         }
 
         const guild = await client.guilds.fetch(process.env.GUILD_ID);
         const member = await guild.members.fetch(discordUser.id).catch(() => null);
         if (!member) {
-          return { success: false, code: 'NOT_IN_GUILD' };
+          result = { success: false, code: 'NOT_IN_GUILD', orderId: 'WEBINAR' };
+          return result;
         }
 
         const memberRoleId = process.env.MEMBER_ROLE_ID;
         const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
         if (!memberRoleId || !lifetimeRoleId) {
-          return { success: false, code: 'NO_ROLE_CONFIG' };
+          result = { success: false, code: 'NO_ROLE_CONFIG', orderId: 'WEBINAR' };
+          return result;
         }
 
         await member.roles.add(memberRoleId);
@@ -187,7 +190,8 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
           email: webinarRow.email
         });
 
-        return { success: true, code: 'OK', orderId: 'WEBINAR' };
+        result = { success: true, code: 'OK', orderId: 'WEBINAR' };
+        return result;
       }
     } finally {
       releaseLock(WEBINAR_LOCK_PATH);
@@ -345,6 +349,9 @@ client.on('messageCreate', async (message) => {
               case 'NOT_FOUND':
                 await message.reply('No valid order found for that code, or it has already been used. If you believe this is an error, contact support.');
                 break;
+              case 'ALREADY_USED':
+                await message.reply('No valid order found for that code, or it has already been used. If you believe this is an error, contact support.');
+                break;
               case 'NOT_IN_GUILD':
                 await message.reply('Please join the server using the permanent invite link first, then run /activate {UUID} again.');
                 break;
@@ -442,6 +449,10 @@ client.on('interactionCreate', async (interaction) => {
         const result = await activateOrderForDiscordUser(uuid, interaction.user);
         if (!result.success) {
           if (result.code === 'NOT_FOUND') {
+            await interaction.editReply('No valid order found for that code, or it has already been used.');
+            return;
+          }
+          if (result.code === 'ALREADY_USED') {
             await interaction.editReply('No valid order found for that code, or it has already been used.');
             return;
           }
