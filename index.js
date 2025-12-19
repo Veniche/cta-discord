@@ -685,6 +685,46 @@ async function runExpiryCheck() {
     appendBotLog('INFO', `Using timezone offset for expiry check`, { tzOffsetHours, iso: today.toISOString().slice(0,10) });
     const expiringOrders = await woocommerce.findOrdersExpiringOn(today);
     appendBotLog('INFO', `Found ${expiringOrders.length} orders expiring today`, { count: expiringOrders.length });
+    // --- ADMIN LOG: EXPIRING ORDERS (PLAIN TEXT) ---
+    try {
+      if (ADMIN_LOG_CHANNEL_ID && client.user) {
+        const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
+        if (!channel?.isTextBased()) return;
+
+        if (expiringOrders.length === 0) {
+          await channel.send(
+            `🟢 **Expiry Check**\nNo memberships expiring today (${today.toISOString().slice(0, 10)})`
+          );
+          return;
+        }
+
+        const header = `⏰ **Expiry Check — ${expiringOrders.length} Orders Expiring Today** (${today.toISOString().slice(0, 10)})\n`;
+        let buffer = header;
+
+        for (const order of expiringOrders) {
+          const meta = order.meta_data || [];
+          const discordId = meta.find(m => m.key === 'discord_id')?.value || 'N/A';
+          const expiry = meta.find(m => m.key === 'expiry_date')?.value || 'unknown';
+
+          const warning = discordId === 'N/A' ? ' ⚠️' : '';
+          const line = `• Order #${order.id} | Discord: ${discordId} | Expiry: ${expiry}${warning}\n`;
+
+          // Flush if message would exceed Discord limit
+          if ((buffer + line).length > 1800) {
+            await channel.send(buffer);
+            buffer = '';
+          }
+
+          buffer += line;
+        }
+
+        if (buffer.trim()) {
+          await channel.send(buffer);
+        }
+      }
+    } catch (err) {
+      appendBotLog('WARN', 'Failed to send expiring orders log to chat', { error: err.message });
+    }
 
     for (const order of expiringOrders) {
       try {
