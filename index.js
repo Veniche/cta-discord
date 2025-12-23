@@ -1,3 +1,4 @@
+import axios from 'axios';
 import express from "express";
 import { Client, GatewayIntentBits, EmbedBuilder, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
 import dotenv from "dotenv";
@@ -672,6 +673,241 @@ app.post("/mod/remove", async (req, res) => {
   }
 });
 
+function getDateWithOffset(daysFromNow = 0) {
+  const tzOffsetHours = parseInt(process.env.TZ_OFFSET_HOURS || '7', 10);
+  const date = new Date(Date.now() + tzOffsetHours * 60 * 60 * 1000);
+  date.setDate(date.getDate() + daysFromNow);
+  return date;
+}
+
+function parseMembershipDuration(productName) {
+  const name = productName.toLowerCase();
+
+  if (name.includes('3 bulan')) {
+    return {
+      label: '3 Bulan',
+      months: 3,
+      renewUrl: 'https://s.id/PerpanjangCTA_3-Bulan'
+    };
+  }
+
+  if (name.includes('1 tahun') || name.includes('12 bulan')) {
+    return {
+      label: '12 Bulan',
+      months: 12,
+      renewUrl: 'https://s.id/PerpanjangCTA_12-Bulan'
+    };
+  }
+
+  return null; // manual review / unknown
+}
+
+function formatDateIndonesia(date) {
+  const days = ['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'];
+  const months = [
+    'Januari','Februari','Maret','April','Mei','Juni',
+    'Juli','Agustus','September','Oktober','November','Desember'
+  ];
+
+  const d = new Date(date);
+  return `${days[d.getDay()]}, ${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function buildReminderMessage({ firstName, durationLabel, expiryDateFormatted, renewUrl }) {
+  return `
+Halo ${firstName},
+
+Keanggotaan **Crypto Teknikal Academy** kamu yang berdurasi **${durationLabel}** akan habis pada esok hari, yaitu **${expiryDateFormatted}**.
+Segera lakukan perpanjang membership kamu sebelum habis!
+
+Untuk kamu yang ingin perpanjang, bisa gunakan kode voucher **MEMBER10** untuk mendapatkan diskon 10% saat perpanjang keanggotaan kamu.
+
+👉 **Perpanjang Keanggotaan Kamu Disini**
+${renewUrl}
+
+Jika link di atas tidak bisa diklik, silakan copy & paste ke browser kamu.
+`;
+}
+
+function buildEmailContent({ firstName, durationLabel, expiryDateFormatted, renewUrl }) {
+  return `
+    <p>Halo ${firstName},</p>
+
+    <p>Keanggotaan <strong>Crypto Teknikal Academy</strong> kamu yang berdurasi <strong>${durationLabel}</strong> akan habis pada esok hari, yaitu <strong>${expiryDateFormatted}</strong>. Segera lakukan perpanjang membership kamu sebelum habis!</p>
+
+    <p>Untuk kamu yang ingin perpanjang, bisa gunakan kode voucher <strong>MEMBER10</strong> untuk mendapatkan diskon 10% saat perpanjang keanggotaan kamu.</p>
+
+    <p>
+      <a href="${renewUrl}" style="
+        display:inline-block;
+        padding:10px 18px;
+        font-size:16px;
+        color:#fff;
+        background-color:#5865F2;
+        text-decoration:none;
+        border-radius:6px;
+      ">👉 Perpanjang Keanggotaan Kamu Disini</a>
+    </p>
+
+    <p>Jika tombol di atas tidak berfungsi, bisa klik link di sini: <a href="${renewUrl}">${renewUrl}</a></p>
+  `;
+}
+
+async function sendExpiryReminderEmail({ firstName, email, durationLabel, expiryDateFormatted, renewUrl }) {
+  if (!email) return { success: false, reason: 'NO_EMAIL' };
+
+  const htmlContent = buildEmailContent({ firstName, durationLabel, expiryDateFormatted, renewUrl });
+
+  try {
+    const response = await axios.post('https://api.mailketing.co.id/api/v1/send', new URLSearchParams({
+      from_name: process.env.MAIL_FROM_NAME,
+      from_email: process.env.MAIL_FROM_EMAIL,
+      recipient: email,
+      subject: '⚠️ Reminder: Keanggotaan Anda Akan Habis Besok',
+      content: htmlContent,
+      attach1: '',
+      attach2: '',
+      attach3: '',
+      api_token: process.env.MAIL_API_TOKEN
+    }));
+
+    appendBotLog('INFO', 'Expiry reminder email sent', { email, apiResponse: response.data });
+    return { success: true };
+  } catch (err) {
+    appendBotLog('ERROR', 'Failed to send expiry reminder email', { email, error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
+async function sendExpiryReminderDMAndEmail(order) {
+  const meta = order.meta_data || [];
+  const discordId = meta.find(m => m.key === 'discord_id')?.value;
+  const firstName =
+    order.billing?.first_name ||
+    'Member';
+
+  const item = order.line_items?.[0];
+  if (!item) {
+    appendBotLog('WARN', 'Reminder skipped — no line item', { orderId: order.id });
+    return { success: false };
+  }
+
+  const membership = parseMembershipDuration(item.name);
+  if (!membership) {
+    appendBotLog('WARN', 'Reminder skipped — unknown product duration', {
+      orderId: order.id,
+      productName: item.name
+    });
+    return { success: false };
+  }
+
+  const expiryDate = new Date(order.expiry_date);
+  const expiryFormatted = formatDateIndonesia(expiryDate);
+
+  if (order.billing?.email) {
+    await sendExpiryReminderEmail({
+      firstName,
+      email: order.billing.email,
+      durationLabel: membership.label,
+      expiryDateFormatted: formatDateIndonesia(order.expiry_date),
+      renewUrl: membership.renewUrl
+    });
+  }
+
+  if (!discordId) {
+    appendBotLog('WARN', 'Reminder skipped — NO DISCORD ID', { orderId: order.id });
+    return { success: false, reason: 'NO_DISCORD_ID' };
+  }
+
+  try {
+    const user = await client.users.fetch(discordId);
+    if (!user) throw new Error('User not found');
+
+    const message = buildReminderMessage({
+      firstName,
+      durationLabel: membership.label,
+      expiryDateFormatted: expiryFormatted,
+      renewUrl: membership.renewUrl
+    });
+
+    await user.send(message);
+
+    appendBotLog('INFO', 'Expiry reminder DM sent', {
+      orderId: order.id,
+      discordId,
+      duration: membership.label
+    });
+
+    return { success: true };
+  } catch (err) {
+    appendBotLog('ERROR', 'Failed to send expiry reminder DM', {
+      orderId: order.id,
+      discordId,
+      error: err.message
+    });
+
+    return { success: false, error: err.message };
+  }
+}
+
+async function runExpiryReminder() {
+  appendBotLog('INFO', 'Running expiry reminder (tomorrow)...');
+
+  try {
+    const guild = await client.guilds.fetch(process.env.GUILD_ID);
+    // Find orders expiring today using a fixed timezone offset (default UTC+7)
+    const tomorrow = getDateWithOffset(1);
+
+    const expiringTomorrow = await woocommerce.findOrdersExpiringOn(tomorrow);
+    appendBotLog(
+      'INFO',
+      `Found ${expiringTomorrow.length} orders expiring tomorrow`,
+      { count: expiringTomorrow.length, date: tomorrow.toISOString().slice(0, 10) }
+    );
+
+    if (!ADMIN_LOG_CHANNEL_ID || !client.user) return;
+
+    const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
+    if (!channel?.isTextBased()) return;
+
+    if (expiringTomorrow.length === 0) {
+      await channel.send(
+        `🟢 **Expiry Reminder**\nNo memberships expiring tomorrow (${tomorrow.toISOString().slice(0, 10)})`
+      );
+      return;
+    }
+
+    let buffer = `⏳ **Memberships Expiring Tomorrow** (${tomorrow.toISOString().slice(0, 10)})\n`;
+
+    for (const order of expiringTomorrow) {
+      const meta = order.meta_data || [];
+      const discordId = meta.find(m => m.key === 'discord_id')?.value || 'N/A';
+      const expiry = meta.find(m => m.key === 'expiry_date')?.value || 'unknown';
+
+      const warning = discordId === 'N/A' ? ' ⚠️' : '';
+      const line = `• Order #${order.id} | Discord: ${discordId} | Expiry: ${expiry}${warning}\n`;
+
+      if ((buffer + line).length > 1800) {
+        await channel.send(buffer);
+        buffer = '';
+      }
+      buffer += line;
+      if (order.id == 8121) {
+        await sendExpiryReminderDMAndEmail(order);
+      }
+    }
+
+    if (buffer.trim()) {
+      await channel.send(buffer);
+    }
+
+    return { success: true, count: expiringTomorrow.length };
+  } catch (err) {
+    appendBotLog('ERROR', 'Expiry reminder failed', { error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
 // --- AUTO-KICK JOB (runs daily) ---
 async function runExpiryCheck() {
   appendBotLog('INFO', 'Running expiry check...');
@@ -800,6 +1036,7 @@ async function runExpiryCheck() {
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
 cron.schedule("0 5 * * *", runExpiryCheck);
+cron.schedule("0 6 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
 app.post('/run-expiry-check', async (req, res) => {
