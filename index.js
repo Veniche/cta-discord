@@ -1054,6 +1054,21 @@ app.post('/run-expiry-check', async (req, res) => {
   }
 });
 
+app.post('/run-expiry-reminder', async (req, res) => {
+  try {
+    const authHeader = req.headers['x-api-key'];
+    if (authHeader !== process.env.DISCORD_API_SECRET) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
+    const result = await runExpiryReminder();
+    return res.json(result);
+  } catch (e) {
+    appendBotLog('ERROR', 'Error in /run-expiry-reminder endpoint', { error: e.message });
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.listen(3000, () => {
   const msg = '🚀 Server running on port 3000';
   console.log(msg);
