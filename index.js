@@ -695,7 +695,7 @@ function parseMembershipDuration(productName) {
     return {
       label: '12 Bulan',
       months: 12,
-      renewUrl: 'https://s.id/PerpanjangCTA_12-Bulan'
+      renewUrl: 'https://s.id/PerpanjangCTA_1-Tahun'
     };
   }
 
