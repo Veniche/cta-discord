@@ -753,17 +753,23 @@ function buildEmailContent({ firstName, durationLabel, expiryDateFormatted, rene
   `;
 }
 
-async function sendExpiryReminderEmail({ firstName, email, durationLabel, expiryDateFormatted, renewUrl }) {
+async function sendExpiryReminderEmail({
+  firstName,
+  email,
+  durationLabel,
+  expiryDateFormatted,
+  renewUrl
+}) {
   if (!email) return { success: false, reason: 'NO_EMAIL' };
 
-  const htmlContent = buildEmailContent({ firstName, durationLabel, expiryDateFormatted, renewUrl });
-
-  appendBotLog('DEBUG', 'Email HTML preview', {
-    email,
-    htmlLength: htmlContent.length
+  const htmlContent = buildEmailContent({
+    firstName,
+    durationLabel,
+    expiryDateFormatted,
+    renewUrl
   });
 
-  const payload = new URLSearchParams({
+  const body = new URLSearchParams({
     from_name: process.env.MAIL_FROM_NAME,
     from_email: process.env.MAIL_FROM_EMAIL,
     recipient: email,
@@ -773,24 +779,32 @@ async function sendExpiryReminderEmail({ firstName, email, durationLabel, expiry
     attach2: '',
     attach3: '',
     api_token: process.env.MAIL_API_TOKEN
-  });
+  }).toString();
 
   try {
-    const response = await axios.post(
-      'https://api.mailketing.co.id/api/v1/send',
-      payload.toString(),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        timeout: 15000
-      }
-    );
+    const res = await fetch('https://api.mailketing.co.id/api/v1/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body).toString()
+      },
+      body
+    });
 
-    appendBotLog('INFO', 'Expiry reminder email sent', { email, apiResponse: response.data });
+    const text = await res.text();
+
+    appendBotLog('INFO', 'Expiry reminder email sent', {
+      email,
+      response: text
+    });
+
     return { success: true };
   } catch (err) {
-    appendBotLog('ERROR', 'Failed to send expiry reminder email', { email, error: err.message });
+    appendBotLog('ERROR', 'Failed to send expiry reminder email', {
+      email,
+      error: err.message
+    });
+
     return { success: false, error: err.message };
   }
 }
