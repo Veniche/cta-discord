@@ -758,18 +758,34 @@ async function sendExpiryReminderEmail({ firstName, email, durationLabel, expiry
 
   const htmlContent = buildEmailContent({ firstName, durationLabel, expiryDateFormatted, renewUrl });
 
+  appendBotLog('DEBUG', 'Email HTML preview', {
+    email,
+    htmlLength: htmlContent.length
+  });
+
+  const payload = new URLSearchParams({
+    from_name: process.env.MAIL_FROM_NAME,
+    from_email: process.env.MAIL_FROM_EMAIL,
+    recipient: email,
+    subject: '⚠️ Reminder: Keanggotaan CTA Anda Akan Habis Besok',
+    content: htmlContent,
+    attach1: '',
+    attach2: '',
+    attach3: '',
+    api_token: process.env.MAIL_API_TOKEN
+  });
+
   try {
-    const response = await axios.post('https://api.mailketing.co.id/api/v1/send', new URLSearchParams({
-      from_name: process.env.MAIL_FROM_NAME,
-      from_email: process.env.MAIL_FROM_EMAIL,
-      recipient: email,
-      subject: '⚠️ Reminder: Keanggotaan CTA Anda Akan Habis Besok',
-      content: htmlContent,
-      attach1: '',
-      attach2: '',
-      attach3: '',
-      api_token: process.env.MAIL_API_TOKEN
-    }));
+    const response = await axios.post(
+      'https://api.mailketing.co.id/api/v1/send',
+      payload.toString(),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        timeout: 15000
+      }
+    );
 
     appendBotLog('INFO', 'Expiry reminder email sent', { email, apiResponse: response.data });
     return { success: true };
@@ -1037,7 +1053,7 @@ async function runExpiryCheck() {
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
 cron.schedule("0 5 * * *", runExpiryCheck);
-cron.schedule("0 11 * * *", runExpiryReminder);
+cron.schedule("0 12 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
 app.post('/run-expiry-check', async (req, res) => {
