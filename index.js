@@ -730,27 +730,17 @@ Jika link di atas tidak bisa diklik, silakan copy & paste ke browser kamu.
 }
 
 function buildEmailContent({ firstName, durationLabel, expiryDateFormatted, renewUrl }) {
-  return `
-    <p>Halo ${firstName},</p>
-
-    <p>Keanggotaan <strong>Crypto Teknikal Academy</strong> kamu yang berdurasi <strong>${durationLabel}</strong> akan habis pada esok hari, yaitu <strong>${expiryDateFormatted}</strong>. Segera lakukan perpanjang membership kamu sebelum habis!</p>
-
-    <p>Untuk kamu yang ingin perpanjang, bisa gunakan kode voucher <strong>MEMBER10</strong> untuk mendapatkan diskon 10% saat perpanjang keanggotaan kamu.</p>
-
-    <p>
-      <a href="${renewUrl}" style="
-        display:inline-block;
-        padding:10px 18px;
-        font-size:16px;
-        color:#fff;
-        background-color:#5865F2;
-        text-decoration:none;
-        border-radius:6px;
-      ">👉 Perpanjang Keanggotaan Kamu Disini</a>
-    </p>
-
-    <p>Jika tombol di atas tidak berfungsi, bisa klik link di sini: <a href="${renewUrl}">${renewUrl}</a></p>
-  `;
+  return (
+    `<p>Halo ${firstName},</p>` +
+    `<p>Keanggotaan <strong>Crypto Teknikal Academy</strong> kamu yang berdurasi <strong>${durationLabel}</strong> akan habis pada esok hari, yaitu <strong>${expiryDateFormatted}</strong>. Segera lakukan perpanjang membership kamu sebelum habis!</p>` +
+    `<p>Untuk kamu yang ingin perpanjang, bisa gunakan kode voucher <strong>MEMBER10</strong> untuk mendapatkan diskon 10% saat perpanjang keanggotaan kamu.</p>` +
+    `<p>` +
+      `<a href="${renewUrl}" style="display:inline-block;padding:10px 18px;font-size:16px;color:#ffffff;background-color:#5865F2;text-decoration:none;border-radius:6px;">` +
+        `Perpanjang Keanggotaan Kamu Disini` +
+      `</a>` +
+    `</p>` +
+    `<p>Jika tombol di atas tidak berfungsi, bisa klik link di sini: <a href="${renewUrl}">${renewUrl}</a></p>`
+  );
 }
 
 async function sendExpiryReminderEmail({
@@ -923,7 +913,9 @@ async function runExpiryReminder() {
         buffer = '';
       }
       buffer += line;
-      await sendExpiryReminderDMAndEmail(order);
+      if (order.id == 8311 || order.id == 8312) {
+        await sendExpiryReminderDMAndEmail(order);
+      }
     }
 
     if (buffer.trim()) {
@@ -1065,7 +1057,7 @@ async function runExpiryCheck() {
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
 cron.schedule("0 5 * * *", runExpiryCheck);
-cron.schedule("0 6 * * *", runExpiryReminder);
+cron.schedule("0 14 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
 app.post('/run-expiry-check', async (req, res) => {
