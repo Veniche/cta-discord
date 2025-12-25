@@ -693,7 +693,7 @@ function parseMembershipDuration(productName) {
 
   if (name.includes('1 tahun') || name.includes('12 bulan')) {
     return {
-      label: '12 Bulan',
+      label: '1 Tahun',
       months: 12,
       renewUrl: 'https://s.id/PerpanjangCTA_1-Tahun'
     };
@@ -801,7 +801,8 @@ async function sendExpiryReminderDMAndEmail(order) {
     return { success: false };
   }
 
-  const expiryDate = new Date(order.expiry_date);
+  const orderExpiry = meta.find(m => m.key === 'expiry_date')?.value;
+  const expiryDate = new Date(orderExpiry);
   const expiryFormatted = formatDateIndonesia(expiryDate);
 
   if (order.billing?.email) {
@@ -809,7 +810,7 @@ async function sendExpiryReminderDMAndEmail(order) {
       firstName,
       email: order.billing.email,
       durationLabel: membership.label,
-      expiryDateFormatted: formatDateIndonesia(order.expiry_date),
+      expiryDateFormatted: formatDateIndonesia(expiryFormatted),
       renewUrl: membership.renewUrl
     });
   }
@@ -1036,7 +1037,7 @@ async function runExpiryCheck() {
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
 cron.schedule("0 5 * * *", runExpiryCheck);
-cron.schedule("0 9 * * *", runExpiryReminder);
+cron.schedule("0 10 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
 app.post('/run-expiry-check', async (req, res) => {
