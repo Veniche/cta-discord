@@ -913,9 +913,7 @@ async function runExpiryReminder() {
         buffer = '';
       }
       buffer += line;
-      if (order.id == 8311 || order.id == 8312) {
-        await sendExpiryReminderDMAndEmail(order);
-      }
+      await sendExpiryReminderDMAndEmail(order);
     }
 
     if (buffer.trim()) {
@@ -1057,7 +1055,7 @@ async function runExpiryCheck() {
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
 cron.schedule("0 5 * * *", runExpiryCheck);
-cron.schedule("0 14 * * *", runExpiryReminder);
+cron.schedule("0 6 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
 app.post('/run-expiry-check', async (req, res) => {
