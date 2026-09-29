@@ -159,6 +159,21 @@ export class WooCommerceService {
     return all;
   }
 
+  // Every order regardless of status, for read-only reports. 'any' can leave out custom statuses that
+  // aren't registered as searchable (such as 'finished'), so those are fetched explicitly and merged.
+  async getAllOrdersAnyStatus(extraStatuses = ['finished']) {
+    const byId = new Map();
+    for (const o of await this.getAllOrders('any')) byId.set(o.id, o);
+    for (const status of extraStatuses) {
+      const orders = await this.getAllOrders(status).catch(error => {
+        appendWCLog({ event: 'getAllOrdersAnyStatus.skipped', status, error: error.message });
+        return [];
+      });
+      for (const o of orders) byId.set(o.id, o);
+    }
+    return [...byId.values()];
+  }
+
   // Find orders that expire on the given date (local date comparison)
   async findOrdersExpiringOn(targetDate) {
     const isoTarget = new Date(targetDate).toISOString().slice(0, 10); // YYYY-MM-DD

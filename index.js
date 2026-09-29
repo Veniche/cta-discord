@@ -8,6 +8,7 @@ import fs from "fs";
 import path from "path";
 import { WooCommerceService } from "./woocommerce-service.js";
 import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv } from "./expiry-plan.js";
+import { buildMembersReport, membersToCsv, auditMemberships, auditToCsv, parseFindQuery, findMembership, formatFindResult, md, AUDIT_CODES } from "./membership-report.js";
 
 dotenv.config();
 
@@ -77,6 +78,11 @@ client.once("clientReady", () => {
   registerAdminCommands().catch(err => {
     appendBotLog('ERROR', 'Could not register /expiry command (bot needs the applications.commands scope in this server)', { error: err.message });
     console.error('Could not register /expiry command:', err.message);
+  });
+  // Admin slash command: /members list | find | audit (read-only)
+  registerMembersCommand().catch(err => {
+    appendBotLog('ERROR', 'Could not register /members command (bot needs the applications.commands scope in this server)', { error: err.message });
+    console.error('Could not register /members command:', err.message);
   });
 });
 
@@ -461,6 +467,16 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith('expiry:')) {
       await handleExpiryButton(interaction).catch(e =>
         appendBotLog('ERROR', '/expiry button failed', { userId: interaction.user.id, error: e.message }));
+      return;
+    }
+    // Admin: /members list | find | audit (read-only)
+    if ((interaction.isChatInputCommand() && interaction.commandName === 'members') ||
+        (interaction.isModalSubmit() && interaction.customId.startsWith('members-key:'))) {
+      const handler = interaction.isModalSubmit() ? handleMembersKeyModal : handleMembersCommand;
+      await handler(interaction).catch(async e => {
+        appendBotLog('ERROR', '/members command failed', { userId: interaction.user.id, error: e.message });
+        await (interaction.deferred || interaction.replied ? interaction.editReply({ content: `Error: ${e.message}` }) : interaction.reply({ content: `Error: ${e.message}`, flags: MessageFlags.Ephemeral })).catch(() => null);
+      });
       return;
     }
 
@@ -1237,6 +1253,33 @@ function recordExpiryKeyFailure(userId) {
   return f;
 }
 
+// Shared by /expiry and /members: counts toward the same per-user lockout and alerts the admin log.
+async function refuseWrongKey(interaction, command, mode) {
+  const f = recordExpiryKeyFailure(interaction.user.id);
+  appendBotLog('WARN', `/${command} wrong key`, { userId: interaction.user.id, tag: interaction.user.tag, mode, attempts: f.count });
+  await logCritical(`/${command} — wrong admin key`, { user: `${interaction.user.tag} (${interaction.user.id})`, mode, attemptsInWindow: f.count, lockedOut: Boolean(f.lockedUntil) });
+  await interaction.reply({
+    content: f.lockedUntil ? 'Wrong key. Too many attempts — locked for 15 minutes.' : `Wrong key. ${EXPIRY_KEY_MAX_FAILURES - f.count} attempt(s) left.`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// After a correct key, the read-only /members commands stop asking for ADMIN_KEY_UNLOCK_MINUTES
+// (default 10; 0 = ask every time). /expiry always asks, since `run` removes members.
+const adminKeyUnlocks = new Map(); // userId -> unlocked until (ms)
+const adminKeyUnlockMs = () => Math.max(0, parseInt(process.env.ADMIN_KEY_UNLOCK_MINUTES || '10', 10) || 0) * 60 * 1000;
+
+function grantAdminKeyUnlock(userId) {
+  const ms = adminKeyUnlockMs();
+  if (ms) adminKeyUnlocks.set(userId, Date.now() + ms);
+}
+
+function adminKeyUnlocked(userId) {
+  if ((adminKeyUnlocks.get(userId) || 0) > Date.now()) return true;
+  adminKeyUnlocks.delete(userId);
+  return false;
+}
+
 async function handleExpiryCommand(interaction) {
   if (!isExpiryAdmin(interaction)) {
     await interaction.reply({ content: 'You are not allowed to use this command.', flags: MessageFlags.Ephemeral });
@@ -1286,16 +1329,11 @@ async function handleExpiryKeyModal(interaction) {
 
   const key = interaction.fields.getTextInputValue('expiry_key');
   if (!expiryKeyMatches(key)) {
-    const f = recordExpiryKeyFailure(interaction.user.id);
-    appendBotLog('WARN', '/expiry wrong key', { userId: interaction.user.id, tag: interaction.user.tag, mode, attempts: f.count });
-    await logCritical('/expiry — wrong admin key', { user: `${interaction.user.tag} (${interaction.user.id})`, mode, attemptsInWindow: f.count, lockedOut: Boolean(f.lockedUntil) });
-    await interaction.reply({
-      content: f.lockedUntil ? 'Wrong key. Too many attempts — locked for 15 minutes.' : `Wrong key. ${EXPIRY_KEY_MAX_FAILURES - f.count} attempt(s) left.`,
-      flags: MessageFlags.Ephemeral,
-    });
+    await refuseWrongKey(interaction, 'expiry', mode);
     return;
   }
   expiryKeyFailures.delete(interaction.user.id);
+  grantAdminKeyUnlock(interaction.user.id);
 
   await runExpiryPreview(interaction, mode, date || null);
 }
@@ -1397,6 +1435,197 @@ async function handleExpiryButton(interaction) {
   // Interaction tokens last 15 minutes; a very large run can outlive it.
   await interaction.editReply({ content: msg }).catch(() =>
     appendBotLog('WARN', 'Could not edit /expiry run reply (token expired?)', { result: { success: result.success, tally: result.tally } }));
+}
+
+// --- /members SLASH COMMAND (admin, read-only) ---
+//   /members list [detailed]   everyone with the member role; detailed adds membership (lifetime /
+//                              N months), expiry and latest order per member. CSV.
+//   /members find user|query   one person by @user, Discord ID, username, email or order number:
+//                              roles, linked orders, whether they have a membership, and any issues.
+//   /members audit             orders and roles that disagree (AUDIT_CODES in membership-report.js). CSV.
+// Same gate as /expiry (isExpiryAdmin + EXPIRY_COMMAND_KEY in a modal); a correct key is remembered for
+// ADMIN_KEY_UNLOCK_MINUTES. Nothing here writes to Discord or WooCommerce.
+const MEMBERS_REQUEST_TTL_MS = 10 * 60 * 1000;
+const pendingMembersRequests = new Map(); // nonce -> { userId, sub, detailed, targetUserId, query, createdAt }
+const NO_PINGS = { parse: [] }; // replies quote user-controlled names
+
+async function registerMembersCommand() {
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const cmd = new SlashCommandBuilder()
+    .setName('members')
+    .setDescription('Membership lookups and audit (admin, read-only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .addSubcommand(s => s.setName('list').setDescription('Everyone with the member role (CSV).')
+      .addBooleanOption(o => o.setName('detailed').setDescription('Add membership (lifetime / months), expiry and latest order').setRequired(false)))
+    .addSubcommand(s => s.setName('find').setDescription('One person: roles, orders and whether they have a membership.')
+      .addUserOption(o => o.setName('user').setDescription('A server member').setRequired(false))
+      .addStringOption(o => o.setName('query').setDescription('Discord ID, username, email or order number').setMaxLength(100).setRequired(false)))
+    .addSubcommand(s => s.setName('audit').setDescription('Orders and roles that disagree (expired but open, no expiry, role without order, ...)'));
+  // create() upserts this one command by name; it does not touch other guild commands.
+  await guild.commands.create(cmd.toJSON());
+  appendBotLog('INFO', 'Registered /members slash command', { guildId: guild.id });
+}
+
+async function handleMembersCommand(interaction) {
+  if (!isExpiryAdmin(interaction)) {
+    await interaction.reply({ content: 'You are not allowed to use this command.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!expiryKeyConfigured()) {
+    await interaction.reply({ content: `/members is disabled: EXPIRY_COMMAND_KEY is not set (or shorter than ${EXPIRY_KEY_MIN_LENGTH} characters) in the bot's .env.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const locked = expiryKeyLockedMinutes(interaction.user.id);
+  if (locked) {
+    await interaction.reply({ content: `Too many wrong keys. Try again in ${locked} minute(s).`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const request = {
+    sub: interaction.options.getSubcommand(), // 'list' | 'find' | 'audit'
+    detailed: interaction.options.getBoolean('detailed') === true,
+    targetUserId: interaction.options.getUser('user')?.id || null,
+    query: (interaction.options.getString('query') || '').trim(),
+  };
+  if (request.sub === 'find' && !request.targetUserId && !request.query) {
+    await interaction.reply({ content: 'Give a `user` or a `query` (Discord ID, username, email or order number).', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (adminKeyUnlocked(interaction.user.id)) {
+    await runMembersRequest(interaction, request);
+    return;
+  }
+
+  // The request waits server-side; the modal only carries a nonce (custom IDs are capped at 100 chars).
+  for (const [k, v] of pendingMembersRequests) if (Date.now() - v.createdAt > MEMBERS_REQUEST_TTL_MS) pendingMembersRequests.delete(k);
+  const nonce = randomUUID();
+  pendingMembersRequests.set(nonce, { ...request, userId: interaction.user.id, createdAt: Date.now() });
+
+  const modal = new ModalBuilder()
+    .setCustomId(`members-key:${nonce}`)
+    .setTitle(`Members ${request.sub} — admin key`);
+  const input = new TextInputBuilder()
+    .setCustomId('expiry_key')
+    .setLabel('Admin key')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(200);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  await interaction.showModal(modal); // must be the first response to the command
+}
+
+async function handleMembersKeyModal(interaction) {
+  const nonce = interaction.customId.slice('members-key:'.length);
+  if (!isExpiryAdmin(interaction)) {
+    await interaction.reply({ content: 'You are not allowed to use this command.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const locked = expiryKeyLockedMinutes(interaction.user.id);
+  if (locked) {
+    await interaction.reply({ content: `Too many wrong keys. Try again in ${locked} minute(s).`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const pending = pendingMembersRequests.get(nonce);
+  if (!expiryKeyMatches(interaction.fields.getTextInputValue('expiry_key'))) {
+    await refuseWrongKey(interaction, 'members', pending?.sub || 'unknown');
+    return;
+  }
+  expiryKeyFailures.delete(interaction.user.id);
+
+  if (!pending || pending.userId !== interaction.user.id || Date.now() - pending.createdAt > MEMBERS_REQUEST_TTL_MS) {
+    await interaction.reply({ content: 'This request expired (or the bot restarted). Run the command again.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  pendingMembersRequests.delete(nonce); // single use
+  grantAdminKeyUnlock(interaction.user.id);
+  await runMembersRequest(interaction, pending);
+}
+
+async function fetchGuildMembersPlain(guild) {
+  const all = await guild.members.fetch(); // needs the GuildMembers intent (enabled above)
+  return [...all.values()].map(m => ({
+    id: m.user.id,
+    username: m.user.username,
+    globalName: m.user.globalName || null,
+    displayName: m.displayName,
+    joinedAt: m.joinedTimestamp || null,
+    bot: Boolean(m.user.bot),
+    roles: [...m.roles.cache.keys()],
+    staff: Boolean(m.permissions?.has(PermissionFlagsBits.ManageRoles)),
+  }));
+}
+
+const csvFile = (text, name) => new AttachmentBuilder(Buffer.from(text, 'utf8'), { name });
+const clipMessage = (s, max = 1900) => (s.length > max ? s.slice(0, max - 2) + '\n…' : s);
+
+async function runMembersRequest(interaction, req) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  appendBotLog('INFO', `/members ${req.sub}`, { userId: interaction.user.id, detailed: req.detailed, targetUserId: req.targetUserId, query: req.query || null });
+
+  const memberRoleId = process.env.MEMBER_ROLE_ID;
+  const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
+  if (!memberRoleId) {
+    await interaction.editReply('MEMBER_ROLE_ID is not set in the bot\'s .env.');
+    return;
+  }
+  const todayIso = localTodayIso();
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const members = await fetchGuildMembersPlain(guild);
+
+  if (req.sub === 'list' && !req.detailed) {
+    const report = buildMembersReport({ members, memberRoleId, lifetimeRoleId, todayIso });
+    await interaction.editReply({ content: formatMembersSummary(report), files: [csvFile(membersToCsv(report), `members-${todayIso}.csv`)], allowedMentions: NO_PINGS });
+    return;
+  }
+
+  const data = { orders: await woocommerce.getAllOrdersAnyStatus(), members, webinarRows: readWebinarCsv(), memberRoleId, lifetimeRoleId, todayIso };
+
+  if (req.sub === 'list') {
+    const report = buildMembersReport(data);
+    await interaction.editReply({ content: formatMembersSummary(report), files: [csvFile(membersToCsv(report), `members-detailed-${todayIso}.csv`)], allowedMentions: NO_PINGS });
+  } else if (req.sub === 'audit') {
+    const audit = auditMemberships(data);
+    appendBotLog('INFO', '/members audit result', { userId: interaction.user.id, counts: Object.fromEntries(audit.summary.map(s => [s.code, s.count])) });
+    const files = audit.findings.length ? [csvFile(auditToCsv(audit), `members-audit-${todayIso}.csv`)] : [];
+    await interaction.editReply({ content: formatAuditSummary(audit), files, allowedMentions: NO_PINGS });
+  } else {
+    const target = req.targetUserId ? { type: 'discord_id', value: req.targetUserId } : parseFindQuery(req.query);
+    const result = findMembership(target, data);
+    await interaction.editReply({ content: formatFindResult(result, { memberRoleId, lifetimeRoleId }), allowedMentions: NO_PINGS });
+  }
+}
+
+const MEMBERSHIP_KIND_LABELS = { none: 'no active order', no_expiry: 'no expiry_date', invalid: 'unreadable expiry_date' };
+
+function formatMembersSummary(report) {
+  const s = report.summary;
+  const lines = [`**Members with the member role: ${s.total}** (lifetime role: ${s.lifetimeRole}) — as of ${report.date}`];
+  if (report.detailed && s.total) {
+    const b = s.byMembership;
+    lines.push(Object.entries(b).sort((x, y) => y[1] - x[1]).map(([k, n]) => `${MEMBERSHIP_KIND_LABELS[k] || k}: ${n}`).join(' · '));
+    const odd = (b.none || 0) + (b.no_expiry || 0) + (b.invalid || 0);
+    if (odd) lines.push(`⚠️ ${odd} member(s) with no active order or no usable expiry_date — see \`/members audit\`.`);
+  }
+  lines.push(s.total ? 'Full list attached (CSV).' : 'Nobody has the member role.');
+  return lines.join('\n');
+}
+
+function formatAuditSummary(audit) {
+  const lines = [`**Membership audit — ${audit.date}** (${audit.scannedOrders} orders, ${audit.scannedMembers ?? '?'} server members; nothing changed)`];
+  const action = audit.summary.filter(s => s.severity === 'action');
+  const info = audit.summary.filter(s => s.severity === 'info');
+  if (!action.length && !info.length) lines.push('✅ No issues found.');
+  if (action.length) lines.push('', '**Needs action**', ...action.map(s => `• ${s.label}: **${s.count}**`));
+  if (info.length) lines.push('', '**FYI**', ...info.map(s => `• ${s.label}: ${s.count}`));
+  const first = audit.findings.filter(f => f.severity === 'action').slice(0, 8);
+  if (first.length) {
+    lines.push('', `First ${first.length}:`);
+    for (const f of first) lines.push(`• ${AUDIT_CODES[f.code][1]} — ${f.orderId ? `#${f.orderId}` : 'no order'}${f.discordId ? ` · \`${f.discordId}\`` : ''} · ${md(f.detail)}`);
+  }
+  lines.push('', 'Orders by status: ' + Object.entries(audit.statusCounts).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(' · '));
+  if (audit.findings.length) lines.push('Full list attached (CSV).');
+  return clipMessage(lines.join('\n'));
 }
 
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
