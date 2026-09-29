@@ -1613,6 +1613,8 @@ function formatMembersSummary(report) {
 
 function formatAuditSummary(audit) {
   const lines = [`**Membership audit — ${audit.date}** (${audit.scannedOrders} orders, ${audit.scannedMembers ?? '?'} server members; nothing changed)`];
+  if (audit.manualMembers) lines.push(`${audit.manualMembers} manual member(s) with no order or webinar code — counted as lifetime; only their roles are checked.`);
+  if (audit.manualWithHints) lines.push(`${audit.manualWithHints} flagged manual member(s) have a possible order — see the possible_order column (a lead, not a link).`);
   const action = audit.summary.filter(s => s.severity === 'action');
   const info = audit.summary.filter(s => s.severity === 'info');
   if (!action.length && !info.length) lines.push('✅ No issues found.');

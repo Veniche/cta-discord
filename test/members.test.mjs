@@ -11,8 +11,8 @@ const TODAY = localTodayIso();
 const shift = d => new Date(Date.parse(TODAY) + d * 86400000).toISOString().slice(0, 10);
 
 const o = ({ id, status = 'completed', product = 'CTA Membership 3 Bulan', total = '499000', discount = '0', discord, username, expiry, old,
-  code = `code-${id}`, created = shift(-20), email = `u${id}@x.com` }) => ({
-  id, status, total, discount_total: discount, discount_tax: '0', billing: { email },
+  code = `code-${id}`, created = shift(-20), email = `u${id}@x.com`, first = '', last = '' }) => ({
+  id, status, total, discount_total: discount, discount_tax: '0', billing: { email, first_name: first, last_name: last },
   date_created_gmt: created + 'T03:00:00', date_paid_gmt: created + 'T03:00:00',
   line_items: [{ name: product, quantity: 1, subtotal: total, subtotal_tax: '0' }],
   meta_data: [
@@ -72,6 +72,7 @@ const members = [
   mem('A', [MR]), mem('B', [MR, LR]), mem('C', [MR]), mem('D', [MR]), mem('E', [MR, LR]), mem('F', [MR]), mem('G', [MR]),
   mem('J', [MR], { staff: true }), mem('Q', [MR]), mem('R', [MR]), mem('S', [MR]), mem('L', [MR, LR]), mem('M', [MR]),
   mem('N', []), mem('X', [MR]), mem('K', [LR]), mem('W', [MR, LR], { username: '=HYPERLINK("x")' }), mem('a_b', [], { username: 'a_b' }),
+  mem('U1', [MR, LR]), mem('U2', [LR]),                                         // manual grants: no order, no webinar code
   mem('BOT', [MR], { bot: true }),
 ];
 const webinarRows = [
@@ -102,8 +103,11 @@ check('audit expired_never_activated = #4', ids('expired_never_activated') === '
 check('audit no_expiry_not_lifetime = #5 (with expected date)', ids('no_expiry_not_lifetime') === '5' && got('no_expiry_not_lifetime')[0].detail.includes('expected'));
 check('audit lifetime_with_expiry = #6', ids('lifetime_with_expiry') === '6');
 check('audit activated_order_not_completed = #7', ids('activated_order_not_completed') === '7');
-check('audit role_without_access = G, J (overdue C and processing F not repeated; bot ignored)', who('role_without_access') === 'G,J');
-check('audit role_without_access marks staff', got('role_without_access').find(f => f.discordId === 'J').detail.includes('staff'));
+check('audit role_without_access = G only (overdue C, processing F, manual J not repeated; bot ignored)', who('role_without_access') === 'G');
+check('audit manual member with member role but no lifetime role = J, marked staff', who('manual_without_lifetime_role') === 'J' &&
+  got('manual_without_lifetime_role')[0].detail.includes('staff'));
+check('audit manual member with both roles (U1) not flagged', !audit.findings.some(f => f.discordId === 'U1'));
+check('audit counts manual members (J, U1, U2)', audit.manualMembers === 3);
 check('audit completed_without_code = #9', ids('completed_without_code') === '9');
 check('audit duplicate_code = #10, #11 (code value never printed)', ids('duplicate_code') === '10,11' && !JSON.stringify(got('duplicate_code')).includes('DUP'));
 check('audit invalid_expiry = #12', ids('invalid_expiry') === '12');
@@ -114,9 +118,9 @@ check('audit active_member_left_server = I', who('active_member_left_server') ==
 check('audit not_activated_yet = #9, #10, #11, #17', ids('not_activated_yet') === '9,10,11,17');
 check('audit no_expiry_unknown_duration = #18', ids('no_expiry_unknown_duration') === '18');
 check('audit expiry_implausible = #19', ids('expiry_implausible') === '19');
-check('audit lifetime_role_without_lifetime_purchase = L', who('lifetime_role_without_lifetime_purchase') === 'L');
+check('audit lifetime_role_without_lifetime_purchase = L', who('lifetime_role_without_lifetime_purchase') === 'L'); // manual U1/U2 excluded
 check('audit lifetime_missing_lifetime_role = M ("Unlimited" product)', who('lifetime_missing_lifetime_role') === 'M');
-check('audit active_missing_member_role = K (webinar lifetime), N', who('active_missing_member_role') === 'K,N');
+check('audit active_missing_member_role = K (webinar), N, U2 (manual lifetime, no member role)', who('active_missing_member_role') === 'K,N,U2');
 check('audit: every finding has a known code', audit.findings.every(f => R.AUDIT_CODES[f.code]));
 check('audit: action codes sorted before info', audit.summary.findIndex(s => s.severity === 'info') > audit.summary.map(s => s.severity).lastIndexOf('action'));
 check('audit: status counts', audit.statusCounts.completed === 19 && audit.statusCounts.finished === 4 && audit.statusCounts.processing === 1);
@@ -125,17 +129,41 @@ const clean = R.auditMemberships({ ...data, orders: [orders[0], orders[1]], memb
 check('audit: consistent data -> no findings', clean.findings.length === 0 && clean.summary.length === 0);
 check('audit without Discord data: order checks only', R.auditMemberships({ ...data, members: null }).findings.every(f => !['role_without_access', 'active_missing_member_role'].includes(f.code)));
 
+// ---- possible-order hints for manual members ----
+const P = { id: 'P', username: 'budisantoso88', globalName: 'Budi', displayName: 'Budi S', roles: [MR], bot: false };
+const hintIdx = R.indexData({ todayIso: TODAY, orders: [
+  o({ id: 50, first: 'Budi', last: 'Santoso', email: 'x1@x.com' }),        // billing name
+  o({ id: 51, first: 'Other', last: 'Person', email: 'budisantoso88@gmail.com' }), // email name
+  o({ id: 52, discord: 'P2', username: 'budisantoso88' }),                  // same username, other Discord ID
+  o({ id: 53, first: 'Budi', email: 'x3@x.com' }),                          // single short name: too weak
+  o({ id: 54, email: 'budi@x.com' }),                                       // short email name: too weak
+  o({ id: 55, discord: 'P3', username: 'someoneelse' }),
+] });
+const hints = R.possibleOrdersFor(P, hintIdx);
+check('hints: username match first, then billing name, then email name', hints.map(h => h.orderId).join() === '52,50,51');
+check('hints: short / single names ignored', !hints.some(h => [53, 54, 55].includes(h.orderId)));
+check('hints: generic word inside a longer username is not a match',
+  R.possibleOrdersFor({ id: 'Q', username: 'cryptolover', roles: [MR] }, R.indexData({ todayIso: TODAY, orders: [o({ id: 56, email: 'crypto@x.com' })] })).length === 0);
+const data2 = { ...data, orders: [...orders, o({ id: 60, code: 'c60', expiry: shift(30), first: 'User', last: 'J', email: 'zz@x.com' })] };
+const audit2 = R.auditMemberships(data2);
+const jf = audit2.findings.find(f => f.code === 'manual_without_lifetime_role');
+check('audit: flagged manual member carries a hint', jf.hint.includes('#60') && jf.hint.includes('billing name matches') && audit2.manualWithHints === 1);
+check('audit: manual member with both roles gets no finding or hint', !audit2.findings.some(f => f.discordId === 'U1'));
+check('audit csv: possible_order column', R.auditToCsv(audit2).split('\n')[0].endsWith(',possible_order') && R.auditToCsv(audit2).includes('#60 (completed, not activated; billing name matches)'));
+check('find: hint shown under the issue', R.formatFindResult(R.findMembership({ type: 'discord_id', value: 'J' }, data2), { memberRoleId: MR, lifetimeRoleId: LR }).includes('Possible order: #60'));
+
 // ---- list ----
 let rep = R.buildMembersReport({ members, memberRoleId: MR, lifetimeRoleId: LR, todayIso: TODAY });
-check('list: member-role holders only, bot excluded', rep.rows.length === 15 && !rep.rows.some(r => r.discordId === 'BOT' || r.discordId === 'N'));
-check('list: simple has no order columns', rep.rows[0].membership === undefined && rep.summary.lifetimeRole === 4);
+check('list: member-role holders only, bot excluded', rep.rows.length === 16 && !rep.rows.some(r => r.discordId === 'BOT' || r.discordId === 'N'));
+check('list: simple has no order columns', rep.rows[0].membership === undefined && rep.summary.lifetimeRole === 5);
 rep = R.buildMembersReport(data);
 const row = id => rep.rows.find(r => r.discordId === id);
 check('list detailed: X -> 12 months, access #24, latest #24', row('X').membership === '12 months' && row('X').accessOrderId === 24 && row('X').latestOrderId === 24);
 check('list detailed: G -> none, latest #8 finished', row('G').kind === 'none' && row('G').latestOrderId === 8 && row('G').latestOrderStatus === 'finished');
-check('list detailed: summary buckets', rep.summary.byMembership.lifetime === 2 && rep.summary.byMembership['lifetime (webinar)'] === 1 && rep.summary.byMembership.none === 4);
+check('list detailed: summary buckets', rep.summary.byMembership.lifetime === 2 && rep.summary.byMembership['lifetime (webinar)'] === 1 && rep.summary.byMembership.none === 3 &&
+  rep.summary.byMembership['lifetime (manual)'] === 1 && rep.summary.byMembership['manual, no lifetime role'] === 1);
 const csv = R.membersToCsv(rep);
-check('csv: header + one line per member', csv.trim().split('\n').length === 16 && csv.startsWith('discord_id,username,display_name'));
+check('csv: header + one line per member', csv.trim().split('\n').length === 17 && csv.startsWith('discord_id,username,display_name'));
 check('csv: formula-looking username neutralised', csv.includes(`"'=HYPERLINK(""x"")"`));
 check('csv: audit export has every finding', R.auditToCsv(audit).trim().split('\n').length === audit.findings.length + 1);
 
@@ -149,6 +177,10 @@ check('find parse: @name -> name', pq('@Some_User').type === 'name' && pq('@Some
 let res = R.findMembership({ type: 'discord_id', value: 'G' }, data);
 let txt = R.formatFindResult(res, { memberRoleId: MR, lifetimeRoleId: LR });
 check('find G: no membership, role_without_access issue shown', txt.includes('Membership: ❌ **none**') && txt.includes('Member role, but no active order'));
+txt = R.formatFindResult(R.findMembership({ type: 'discord_id', value: 'U1' }, data), { memberRoleId: MR, lifetimeRoleId: LR });
+check('find manual member with both roles: lifetime (manual), no issues', txt.includes('✅ **lifetime (manual)**') && txt.includes('No issues found.'));
+txt = R.formatFindResult(R.findMembership({ type: 'discord_id', value: 'J' }, data), { memberRoleId: MR, lifetimeRoleId: LR });
+check('find manual member without lifetime role: warned + issue', txt.includes('⚠️ **manual, no lifetime role**') && txt.includes('without the lifetime role'));
 res = R.findMembership(pq('user_x'), data);
 check('find by exact username -> one subject (X)', res.subjects.length === 1 && res.subjects[0].discordId === 'X');
 txt = R.formatFindResult(res, { memberRoleId: MR, lifetimeRoleId: LR });

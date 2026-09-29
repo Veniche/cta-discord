@@ -113,6 +113,7 @@ export function orderView(order, todayIso) {
     discordId,
     discordUsername: metaStr(order, 'discord_username'),
     email: String(order.billing?.email || '').trim().toLowerCase(),
+    billingName: [order.billing?.first_name, order.billing?.last_name].filter(Boolean).join(' ').trim(),
     hasCode: Boolean(metaOf(order, process.env.WC_UUID_META_KEY || 'activation_uuid')),
     code: metaStr(order, process.env.WC_UUID_META_KEY || 'activation_uuid'), // for duplicate detection only; never printed
     activated: Boolean(discordId || metaOf(order, 'activation_used')),
@@ -171,6 +172,58 @@ export function membershipFor(discordId, idx) {
   };
 }
 
+// --- Manual grants ---
+// Admins also give roles by hand (like the webinar codes), and by policy those grants are lifetime. So
+// a server member with no WooCommerce order and no webinar code who holds the member or lifetime role
+// is a manual member: counted as lifetime, and the audit only checks that they hold both roles.
+export function isManualMember(member, ms, { memberRoleId, lifetimeRoleId }) {
+  if (!member || ms.orders.length || ms.webinar) return false;
+  return member.roles.includes(memberRoleId) || Boolean(lifetimeRoleId && member.roles.includes(lifetimeRoleId));
+}
+
+// membershipFor() plus the manual-grant rule, for display (list, find).
+export function describeMembership(ms, member, roles) {
+  if (!isManualMember(member, ms, roles)) return ms;
+  const hasLifetimeRole = Boolean(roles.lifetimeRoleId && member.roles.includes(roles.lifetimeRoleId));
+  return { ...ms, active: true, lifetime: true, kind: 'manual', source: 'manual', label: hasLifetimeRole ? 'lifetime (manual)' : 'manual, no lifetime role' };
+}
+
+// --- Possible orders for a manual member ---
+// Leads, not links: an admin confirms by hand. Strongest first:
+//   1. an order activated by a Discord account with the same username (renamed or alt account)
+//   2. an order never activated whose billing name matches the member's Discord names
+//   3. an order never activated whose email name matches the member's Discord names
+const handle = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const similar = (a, b) => {
+  if (a.length < 5 || b.length < 5) return false;
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return short.length >= 6 && short.length / long.length >= 0.6 && long.includes(short);
+};
+
+export function possibleOrdersFor(member, idx, max = 3) {
+  const names = [...new Set([member.username, member.globalName, member.displayName].map(handle).filter(Boolean))];
+  const usernames = new Set([member.username, member.globalName].filter(Boolean).map(n => String(n).toLowerCase()));
+  const hints = [];
+  for (const v of idx.views) {
+    if (v.discordId === member.id) continue;
+    let reason = null;
+    if (v.discordId) {
+      const stored = String(v.discordUsername || '').toLowerCase().split('#')[0];
+      if (stored && usernames.has(stored)) reason = `order username "${v.discordUsername}" matches, activated by Discord ID ${v.discordId}`;
+    } else {
+      const tokens = v.billingName.split(/\s+/).map(handle).filter(t => t.length >= 3);
+      const nameHit = tokens.length >= 2 ? names.some(n => tokens.every(t => n.includes(t))) : names.some(n => similar(n, handle(v.billingName)));
+      if (nameHit) reason = 'billing name matches';
+      else if (names.some(n => similar(n, handle(v.email.split('@')[0])))) reason = 'email name matches';
+    }
+    if (reason) hints.push({ orderId: v.id, status: v.status, activated: v.activated, reason, rank: v.discordId ? 0 : reason.startsWith('billing') ? 1 : 2 });
+  }
+  return hints.sort((a, b) => a.rank - b.rank || b.orderId - a.orderId).slice(0, max);
+}
+
+export const formatHints = hints => hints.map(h => `#${h.orderId} (${h.status}${h.activated ? '' : ', not activated'}; ${h.reason})`).join('; ');
+
 // --- /members list ---
 const joinedDay = ms => (ms ? new Date(ms).toISOString().slice(0, 10) : '');
 
@@ -184,7 +237,7 @@ export function buildMembersReport({ members, orders = null, webinarRows = [], m
       lifetimeRole: Boolean(lifetimeRoleId && m.roles.includes(lifetimeRoleId)), staff: Boolean(m.staff),
     };
     if (!idx) return row;
-    const ms = membershipFor(m.id, idx);
+    const ms = describeMembership(membershipFor(m.id, idx), m, { memberRoleId, lifetimeRoleId });
     return {
       ...row,
       membership: ms.label, kind: ms.kind, source: ms.source,
@@ -198,7 +251,7 @@ export function buildMembersReport({ members, orders = null, webinarRows = [], m
   if (idx) {
     const byMembership = {};
     for (const r of rows) {
-      const key = r.kind === 'dated' ? r.membership : r.kind === 'lifetime' ? r.membership : r.kind;
+      const key = ['dated', 'lifetime', 'manual'].includes(r.kind) ? r.membership : r.kind;
       byMembership[key] = (byMembership[key] || 0) + 1;
     }
     summary.byMembership = byMembership;
@@ -222,6 +275,7 @@ export function membersToCsv(report) {
 export const AUDIT_CODES = {
   overdue_not_removed: ['action', 'Expired, order still completed (role not removed yet)'],
   role_without_access: ['action', 'Member role, but no active order'],
+  manual_without_lifetime_role: ['action', 'Manual member (no order) without the lifetime role'],
   activated_order_not_completed: ['action', 'Activated, but order is not completed (never expires)'],
   no_expiry_not_lifetime: ['action', 'Time-limited product with no expiry_date (never removed)'],
   no_expiry_unknown_duration: ['action', 'No expiry_date and the duration is unknown'],
@@ -247,7 +301,7 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
   const idx = indexData({ orders, webinarRows, todayIso });
   const findings = [];
   const add = (code, fields, detail) =>
-    findings.push({ code, severity: AUDIT_CODES[code][0], orderId: null, discordId: null, username: '', email: '', ...fields, detail });
+    findings.push({ code, severity: AUDIT_CODES[code][0], orderId: null, discordId: null, username: '', email: '', hint: '', ...fields, detail });
   const fromOrder = v => ({ orderId: v.id, discordId: v.discordId, username: v.discordUsername || '', email: v.email });
 
   const byCode = new Map();
@@ -293,7 +347,9 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
     for (const v of vs) add('duplicate_code', fromOrder(v), `same code as order ${vs.filter(x => x !== v).map(x => '#' + x.id).join(', ')}`);
   }
 
+  let manualMembers = null;
   if (members) {
+    manualMembers = 0;
     const inGuild = new Set(members.map(m => m.id));
     // Already reported per order, with the reason; don't list the same person again as "role without order".
     const explained = new Set(findings.filter(f => ['overdue_not_removed', 'activated_order_not_completed'].includes(f.code)).map(f => f.discordId));
@@ -306,11 +362,20 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
       const who = { discordId: m.id, username: m.username, orderId: ref?.id ?? null, email: ref?.email || '' };
       const staff = m.staff ? ' — staff (Manage Roles)' : '';
 
+      // Manual grant (see isManualMember): lifetime by policy, so only the pair of roles is checked.
+      if (isManualMember(m, ms, { memberRoleId, lifetimeRoleId })) {
+        manualMembers++;
+        const flagged = (hasMember && !hasLifetime && lifetimeRoleId) || (hasLifetime && !hasMember);
+        const hint = flagged ? formatHints(possibleOrdersFor(m, idx)) : '';
+        if (hasMember && !hasLifetime && lifetimeRoleId) add('manual_without_lifetime_role', { ...who, hint }, 'no WooCommerce order or webinar code' + staff);
+        if (hasLifetime && !hasMember) add('active_missing_member_role', { ...who, hint }, 'manual lifetime member (no order) without the member role');
+        continue;
+      }
+
       if (hasMember && !ms.active && !explained.has(m.id)) {
-        const last = ms.latestOrder;
-        add('role_without_access', who, (last
-          ? `latest order #${last.id} is ${last.status}${last.isOld ? ' (is_old)' : ''}${last.expiry && last.expiry !== 'INVALID' ? `, expiry ${last.expiry}` : ''}`
-          : 'no order linked to this Discord ID') + staff);
+        const last = ms.latestOrder; // not manual and no webinar code, so there is at least one order
+        add('role_without_access', who,
+          `latest order #${last.id} is ${last.status}${last.isOld ? ' (is_old)' : ''}${last.expiry && last.expiry !== 'INVALID' ? `, expiry ${last.expiry}` : ''}` + staff);
       }
       if (ms.active && !hasMember) {
         add('active_missing_member_role', who, ms.lifetime
@@ -342,6 +407,8 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
     date: todayIso,
     scannedOrders: idx.views.length,
     scannedMembers: members ? members.filter(m => !m.bot).length : null,
+    manualMembers,
+    manualWithHints: findings.filter(f => f.hint).length,
     findings,
     summary: CODE_ORDER.filter(c => counts[c]).map(code => ({ code, severity: AUDIT_CODES[code][0], label: AUDIT_CODES[code][1], count: counts[code] })),
     statusCounts,
@@ -350,8 +417,8 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
 
 export function auditToCsv(audit) {
   return toCsv(
-    ['severity', 'code', 'issue', 'order_id', 'discord_id', 'username', 'email', 'detail'],
-    audit.findings.map(f => [f.severity, f.code, AUDIT_CODES[f.code][1], f.orderId, f.discordId, f.username, f.email, f.detail]),
+    ['severity', 'code', 'issue', 'order_id', 'discord_id', 'username', 'email', 'detail', 'possible_order'],
+    audit.findings.map(f => [f.severity, f.code, AUDIT_CODES[f.code][1], f.orderId, f.discordId, f.username, f.email, f.detail, f.hint]),
   );
 }
 
@@ -370,6 +437,7 @@ const MAX_SUBJECTS = 3;
 export function findMembership(target, { orders, members = [], webinarRows = [], memberRoleId, lifetimeRoleId, todayIso }) {
   const idx = indexData({ orders, webinarRows, todayIso });
   const memberById = new Map(members.map(m => [m.id, m]));
+  const shown = id => describeMembership(membershipFor(id, idx), memberById.get(id), { memberRoleId, lifetimeRoleId });
   let discordIds = [];
   let unlinked = [];
 
@@ -400,14 +468,14 @@ export function findMembership(target, { orders, members = [], webinarRows = [],
     const exact = [...hits].filter(([, e]) => e).map(([id]) => id);
     discordIds = exact.length === 1 ? exact : [...hits.keys()];
     if (discordIds.length > 1) {
-      return { target, subjects: [], unlinked: [], candidates: discordIds.map(id => candidate(id, memberById.get(id), membershipFor(id, idx), memberRoleId)) };
+      return { target, subjects: [], unlinked: [], candidates: discordIds.map(id => candidate(id, memberById.get(id), shown(id), memberRoleId)) };
     }
   }
 
-  const candidates = discordIds.slice(MAX_SUBJECTS).map(id => candidate(id, memberById.get(id), membershipFor(id, idx), memberRoleId));
+  const candidates = discordIds.slice(MAX_SUBJECTS).map(id => candidate(id, memberById.get(id), shown(id), memberRoleId));
   const audit = auditMemberships({ orders, members, webinarRows, memberRoleId, lifetimeRoleId, todayIso });
   const subjects = discordIds.slice(0, MAX_SUBJECTS).map(id => {
-    const membership = membershipFor(id, idx);
+    const membership = shown(id);
     const orderIds = new Set(membership.orders.map(v => v.id));
     return {
       discordId: id,
@@ -446,6 +514,9 @@ function membershipLine(ms) {
   if (!ms.active) {
     const last = ms.latestOrder;
     return `Membership: ❌ **none**${last ? ` — latest order #${last.id} ${last.status}${ms.lastExpiry ? `, last expiry ${ms.lastExpiry}` : ''}` : ' — no orders linked'}`;
+  }
+  if (ms.kind === 'manual') {
+    return `Membership: ${ms.label.startsWith('lifetime') ? '✅' : '⚠️'} **${ms.label}** — no WooCommerce order or webinar code (granted by hand)`;
   }
   const via = ms.source === 'webinar' ? 'webinar code' : `order #${ms.accessOrder.id}`;
   if (ms.kind === 'dated') {
@@ -489,7 +560,7 @@ export function formatFindResult(result, { memberRoleId, lifetimeRoleId, maxOrde
       for (const v of ms.orders.slice(0, maxOrders)) lines.push(orderLine(v));
       if (ms.orders.length > maxOrders) lines.push(`… ${ms.orders.length - maxOrders} older`);
     }
-    for (const f of s.findings) lines.push(`⚠️ ${AUDIT_CODES[f.code][1]} — ${md(f.detail)}`);
+    for (const f of s.findings) lines.push(`⚠️ ${AUDIT_CODES[f.code][1]} — ${md(f.detail)}${f.hint ? `\n   Possible order: ${md(f.hint)}` : ''}`);
     if (!s.findings.length) lines.push('No issues found.');
   }
 
