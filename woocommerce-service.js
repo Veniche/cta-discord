@@ -129,6 +129,36 @@ export class WooCommerceService {
     }
   }
 
+  // Fetch every order with the given status in one pass (newest first), retrying transient
+  // failures (429 / 5xx / network) so one hiccup doesn't abort the daily expiry run.
+  async getAllOrders(status = 'completed') {
+    const perPage = 100;
+    const all = [];
+    for (let page = 1; ; page++) {
+      let response;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          response = await this.api.get('orders', { per_page: perPage, page, status, orderby: 'date', order: 'desc' });
+          break;
+        } catch (error) {
+          const code = error.response?.status;
+          const transient = !code || code === 429 || code >= 500;
+          if (!transient || attempt >= 4) {
+            appendWCLog({ event: 'getAllOrders.error', status, page, attempt, code, error: error.message });
+            throw error;
+          }
+          await new Promise(res => setTimeout(res, 2000 * attempt));
+        }
+      }
+      const orders = response.data || [];
+      all.push(...orders);
+      const totalPages = parseInt(response.headers?.['x-wp-totalpages'] || '0', 10);
+      if (orders.length < perPage || (totalPages && page >= totalPages)) break;
+    }
+    appendWCLog({ event: 'getAllOrders', status, count: all.length });
+    return all;
+  }
+
   // Find orders that expire on the given date (local date comparison)
   async findOrdersExpiringOn(targetDate) {
     const isoTarget = new Date(targetDate).toISOString().slice(0, 10); // YYYY-MM-DD

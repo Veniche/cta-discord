@@ -1,11 +1,13 @@
 import axios from 'axios';
 import express from "express";
-import { Client, GatewayIntentBits, EmbedBuilder, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
+import { Client, GatewayIntentBits, EmbedBuilder, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, AttachmentBuilder } from "discord.js";
+import { randomUUID, createHash, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
 import cron from "node-cron";
 import fs from "fs";
 import path from "path";
 import { WooCommerceService } from "./woocommerce-service.js";
+import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv } from "./expiry-plan.js";
 
 dotenv.config();
 
@@ -71,6 +73,11 @@ client.once("clientReady", () => {
   appendBotLog('INFO', msg);
   // Post activation message on startup if configured
   postActivationMessage().catch(() => null);
+  // Admin slash command: /expiry check | run
+  registerAdminCommands().catch(err => {
+    appendBotLog('ERROR', 'Could not register /expiry command (bot needs the applications.commands scope in this server)', { error: err.message });
+    console.error('Could not register /expiry command:', err.message);
+  });
 });
 
 client.login(process.env.DISCORD_TOKEN);
@@ -206,6 +213,15 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
     const found = await woocommerce.findOrderByUUID(uuid);
     if (!found) {
       result = { success: false, code: 'NOT_FOUND' };
+      return result;
+    }
+
+    // Refuse codes whose membership has already ended — otherwise a late activation would grant a
+    // role that the expiry job (which acts on/after the expiry date) removes again, or never did.
+    const foundExpiry = (found.order?.meta_data || []).find(m => m.key === 'expiry_date')?.value;
+    if (isExpiredForActivation(foundExpiry, localTodayIso())) {
+      appendBotLog('INFO', 'Activation refused: membership already expired', { orderId: found.orderId, userId: discordUser.id, expiry: normalizeExpiry(foundExpiry) });
+      result = { success: false, code: 'EXPIRED', orderId: found.orderId, expiry: normalizeExpiry(foundExpiry) };
       return result;
     }
 
@@ -355,6 +371,9 @@ client.on('messageCreate', async (message) => {
               case 'ALREADY_USED':
                 await message.reply('No valid order found for that code, or it has already been used. If you believe this is an error, contact support.');
                 break;
+              case 'EXPIRED':
+                await message.reply(`This activation code's membership ended on ${result.expiry}. To renew, or if you think this is a mistake, contact the admin on Telegram @cryptoteknikal_admin.`);
+                break;
               case 'NOT_IN_GUILD':
                 await message.reply('Please join the server using the permanent invite link first, then run /activate {UUID} again.');
                 break;
@@ -423,6 +442,28 @@ client.on('messageCreate', async (message) => {
 // --- INTERACTION HANDLERS (buttons + modals) ---
 client.on('interactionCreate', async (interaction) => {
   try {
+    // Admin: /expiry check | run, and its Confirm/Cancel buttons
+    if (interaction.isChatInputCommand() && interaction.commandName === 'expiry') {
+      await handleExpiryCommand(interaction).catch(async e => {
+        appendBotLog('ERROR', '/expiry command failed', { userId: interaction.user.id, error: e.message });
+        const payload = { content: `Error: ${e.message}`, flags: MessageFlags.Ephemeral };
+        await (interaction.deferred || interaction.replied ? interaction.editReply({ content: payload.content }) : interaction.reply(payload)).catch(() => null);
+      });
+      return;
+    }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('expiry-key:')) {
+      await handleExpiryKeyModal(interaction).catch(async e => {
+        appendBotLog('ERROR', '/expiry key modal failed', { userId: interaction.user.id, error: e.message });
+        await (interaction.deferred || interaction.replied ? interaction.editReply({ content: `Error: ${e.message}` }) : interaction.reply({ content: `Error: ${e.message}`, flags: MessageFlags.Ephemeral })).catch(() => null);
+      });
+      return;
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('expiry:')) {
+      await handleExpiryButton(interaction).catch(e =>
+        appendBotLog('ERROR', '/expiry button failed', { userId: interaction.user.id, error: e.message }));
+      return;
+    }
+
     // Button: open the activation modal
     if (interaction.isButton() && interaction.customId === 'open-activate-modal') {
       const modal = new ModalBuilder()
@@ -457,6 +498,10 @@ client.on('interactionCreate', async (interaction) => {
           }
           if (result.code === 'ALREADY_USED') {
             await interaction.editReply('No valid order found for that code, or it has already been used.');
+            return;
+          }
+          if (result.code === 'EXPIRED') {
+            await interaction.editReply(`This activation code's membership ended on ${result.expiry}. To renew, or if you think this is a mistake, contact the admin on Telegram @cryptoteknikal_admin.`);
             return;
           }
           if (result.code === 'NOT_IN_GUILD') {
@@ -928,133 +973,434 @@ async function runExpiryReminder() {
 }
 
 // --- AUTO-KICK JOB (runs daily) ---
-async function runExpiryCheck() {
-  appendBotLog('INFO', 'Running expiry check...');
+// Removes the member role for every completed, non-old order whose expiry_date is today OR
+// earlier (overdue orders from a missed run are caught up automatically).
+//
+// Triggers: daily cron, POST /run-expiry-check, and the /expiry slash command (check | run).
+// Options:
+//   dryRun: true            plan only — no role removal, no WC writes, no channel posts
+//   date: 'YYYY-MM-DD'      evaluate as of another day (live runs: today or earlier only)
+//   maxRemovals: N          raise the safety cap for a one-off catch-up run
+//   onlyOrderIds: [...]     execute only these orders (what an admin previewed in Discord)
+//   triggeredBy: string     shown in logs / admin channel
+// Safety cap: if a live run would remove more than EXPIRY_MAX_REMOVALS (default 30) members, it
+// removes nobody and raises a critical alert. Nothing is lost — overdue orders are picked up on the
+// next run — so review with a dry run and re-run manually.
+const DEFAULT_MAX_REMOVALS = parseInt(process.env.EXPIRY_MAX_REMOVALS || '30', 10);
+let expiryRunActive = false; // one live run at a time (cron vs manual)
+
+async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAULT_MAX_REMOVALS, onlyOrderIds = null, triggeredBy = 'cron' } = {}) {
+  const todayIso = localTodayIso();
+
+  if (date !== null && (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date))) {
+    return { success: false, error: 'date must be YYYY-MM-DD' };
+  }
+  const cap = Number.isInteger(maxRemovals) && maxRemovals >= 0 ? maxRemovals : DEFAULT_MAX_REMOVALS;
+  const targetIso = date || todayIso;
+  if (!dryRun && targetIso > todayIso) {
+    return { success: false, error: 'Live runs cannot target a future date (would remove members early). Use a dry run.' };
+  }
+  if (!dryRun && expiryRunActive) {
+    return { success: false, busy: true, error: 'Another expiry run is in progress. Try again when it finishes.' };
+  }
+
+  appendBotLog('INFO', 'Running expiry check...', { dryRun, targetIso, cap, triggeredBy, onlyOrderIds: onlyOrderIds ? onlyOrderIds.length : null });
+  if (!dryRun) expiryRunActive = true;
 
   try {
+    // One fetch for the whole run (was: a full scan of every order per expiring order).
+    const orders = await woocommerce.getAllOrders('completed');
+    let plan = planExpiryRun(orders, targetIso);
+    if (onlyOrderIds) plan = restrictPlan(plan, onlyOrderIds);
+    appendBotLog('INFO', `Found ${plan.results.length} orders due (expiry on/before ${targetIso})`, { dryRun, triggeredBy, ...plan.summary });
+
+    if (plan.invalid.length) {
+      appendBotLog('WARN', 'Orders with unparseable expiry_date (skipped)', { invalid: plan.invalid });
+    }
+
+    if (dryRun) {
+      return { success: true, dryRun: true, cap, wouldHalt: plan.summary.remove > cap, ...plan };
+    }
+
+    if (plan.summary.remove > cap) {
+      const details = { date: targetIso, wouldRemove: plan.summary.remove, overdue: plan.summary.remove_overdue, cap, triggeredBy,
+        next: 'Review with /expiry check (or {"dryRun":true}), then /expiry run' };
+      appendBotLog('ERROR', 'Expiry run halted: removal count above safety cap', details);
+      await logCritical('Expiry Run Halted — Too Many Removals', details);
+      return { success: false, halted: true, ...details };
+    }
+
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
 
-    // Find orders expiring today using a fixed timezone offset (default UTC+7)
-    const tzOffsetHours = parseInt(process.env.TZ_OFFSET_HOURS || '7', 10);
-    const today = new Date(Date.now() + tzOffsetHours * 60 * 60 * 1000);
-    appendBotLog('INFO', `Using timezone offset for expiry check`, { tzOffsetHours, iso: today.toISOString().slice(0,10) });
-    const expiringOrders = await woocommerce.findOrdersExpiringOn(today);
-    appendBotLog('INFO', `Found ${expiringOrders.length} orders expiring today`, { count: expiringOrders.length });
-    // --- ADMIN LOG: EXPIRING ORDERS (PLAIN TEXT) ---
-    try {
-      if (ADMIN_LOG_CHANNEL_ID && client.user) {
-        const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
-        if (!channel?.isTextBased()) return;
+    // Admin log is best-effort: a failure here must never skip removals (it used to `return`).
+    await postExpiryAdminLog(plan, triggeredBy).catch(err =>
+      appendBotLog('WARN', 'Failed to send expiring orders log to chat', { error: err.message }));
 
-        if (expiringOrders.length === 0) {
-          await channel.send(
-            `🟢 **Expiry Check**\nNo memberships expiring today (${today.toISOString().slice(0, 10)})`
-          );
-          return;
-        }
+    const outcomes = await executeExpiryPlan(plan, {
+      removeMember: async discordId => {
+        // Members who already left can't have a role removed; treat as done instead of failing
+        // (and alerting) on every daily run forever.
+        const probe = await guild.members.fetch(discordId).catch(e => e);
+        if (probe && (probe.code === 10007 || probe.code === 10013)) return { success: true, notInGuild: true };
+        return removeMember(guild, discordId, 'Membership expired', triggeredBy === 'cron' ? 'SYSTEM' : triggeredBy);
+      },
+      markOrderFinished: orderId => woocommerce.markOrderFinished(orderId),
+      log: appendBotLog,
+      critical: logCritical,
+      notifyRenewal: r => postKeptMembershipAlert(r).catch(err =>
+        appendBotLog('WARN', 'Failed to send renewal alert to Discord', { error: err.message })),
+    });
 
-        const header = `⏰ **Expiry Check — ${expiringOrders.length} Orders Expiring Today** (${today.toISOString().slice(0, 10)})\n`;
-        let buffer = header;
-
-        for (const order of expiringOrders) {
-          const meta = order.meta_data || [];
-          const discordId = meta.find(m => m.key === 'discord_id')?.value || 'N/A';
-          const expiry = meta.find(m => m.key === 'expiry_date')?.value || 'unknown';
-
-          const warning = discordId === 'N/A' ? ' ⚠️' : '';
-          const line = `• Order #${order.id} | Discord: ${discordId} | Expiry: ${expiry}${warning}\n`;
-
-          // Flush if message would exceed Discord limit
-          if ((buffer + line).length > 1800) {
-            await channel.send(buffer);
-            buffer = '';
-          }
-
-          buffer += line;
-        }
-
-        if (buffer.trim()) {
-          await channel.send(buffer);
-        }
-      }
-    } catch (err) {
-      appendBotLog('WARN', 'Failed to send expiring orders log to chat', { error: err.message });
-    }
-
-    for (const order of expiringOrders) {
-      try {
-        const meta = order.meta_data || [];
-        const discordMeta = meta.find(m => m.key === 'discord_id');
-        const discordId = discordMeta?.value;
-        if (!discordId) {
-          appendBotLog('WARN', 'Order expiring but no discord_id meta', { orderId: order.id });
-          continue;
-        }
-
-        // Check if user has a newer active order (e.g., renewed membership)
-        const activeOrder = await woocommerce.findActiveOrderByDiscordId(discordId);
-        if (activeOrder && activeOrder.id !== order.id) {
-          // Found a newer active order — skip removal and mark this old order finished
-          await woocommerce.markOrderFinished(order.id).catch(async err => {
-            appendBotLog('ERROR', 'Failed to mark old order finished (newer active exists)', { orderId: order.id, discordId, newerOrderId: activeOrder.id, error: err.message });
-          });
-          appendBotLog('INFO', 'Skipped role removal — newer active order exists', { discordId, expiredOrderId: order.id, activeOrderId: activeOrder.id });
-          
-          // Send a notification to the admin log channel
-          try {
-            if (ADMIN_LOG_CHANNEL_ID && client.user) {
-              const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
-              if (channel?.isTextBased()) {
-                const embed = new EmbedBuilder()
-                  .setColor(0x0099ff)
-                  .setTitle('📝 Membership Renewal Detected')
-                  .addFields(
-                    { name: 'Discord ID', value: discordId, inline: true },
-                    { name: 'Expired Order ID', value: `${order.id}`, inline: true },
-                    { name: 'New Active Order ID', value: `${activeOrder.id}`, inline: true }
-                  )
-                  .setTimestamp()
-                  .setFooter({ text: 'Renewal Alert' });
-                await channel.send({ embeds: [embed] });
-              }
-            }
-          } catch (err) {
-            appendBotLog('WARN', 'Failed to send renewal alert to Discord', { error: err.message });
-          }
-          
-          continue;
-        }
-
-        const result = await removeMember(guild, discordId, 'Membership expired');
-        if (!result.success) {
-          const msg = `Failed to remove membership role (expiry)`;
-          appendBotLog('ERROR', msg, { discordId, orderId: order.id, error: result.error });
-          await logCritical('Auto-Removal Failed', { discordId, orderId: order.id, reason: result.error });
-          continue;
-        }
-
-        // After successful removal, mark order finished and is_old
-        await woocommerce.markOrderFinished(order.id).catch(async err => {
-          const msg = 'Failed to mark order finished after role removal';
-          appendBotLog('ERROR', msg, { orderId: order.id, discordId, error: err.message });
-          await logCritical('Mark Order Finished Failed', { orderId: order.id, discordId, error: err.message });
-        });
-        appendBotLog('INFO', 'Auto-removed membership role and marked order finished', { discordId, orderId: order.id });
-      } catch (oe) {
-        appendBotLog('ERROR', 'Error handling expiring order', { orderId: order.id, error: oe.message });
-        await logCritical('Expiry Check Error', { orderId: order.id, error: oe.message });
-      }
-    }
-    return { success: true, count: expiringOrders.length };
+    const tally = outcomes.reduce((acc, o) => ({ ...acc, [o.outcome]: (acc[o.outcome] || 0) + 1 }), {});
+    const failed = outcomes.filter(o => o.outcome === 'failed');
+    return { success: failed.length === 0, date: targetIso, count: plan.results.length, summary: plan.summary, tally, failed };
   } catch (err) {
-    appendBotLog('ERROR', 'Error running expiry job', { error: err.message });
-    await logCritical('Expiry Job Critical Error', { error: err.message });
+    appendBotLog('ERROR', 'Error running expiry job', { error: err.message, triggeredBy });
+    await logCritical('Expiry Job Critical Error', { error: err.message, targetIso, triggeredBy });
     return { success: false, error: err.message };
+  } finally {
+    if (!dryRun) expiryRunActive = false;
   }
 }
 
+async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
+  if (!ADMIN_LOG_CHANNEL_ID || !client.user) return;
+  const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel?.isTextBased()) {
+    appendBotLog('WARN', 'Admin log channel unavailable; continuing expiry run without it', { ADMIN_LOG_CHANNEL_ID });
+    return;
+  }
+
+  // Overdue never-activated orders have no role to remove and would repeat every day — count only.
+  const shown = plan.results.filter(r => !(r.action === 'no_discord_id' && r.overdue));
+  const hiddenUnactivated = plan.results.length - shown.length;
+  const by = triggeredBy === 'cron' ? '' : ` — manual run by ${triggeredBy}`;
+
+  if (shown.length === 0 && plan.invalid.length === 0) {
+    await channel.send(`🟢 **Expiry Check**${by}\nNo memberships expiring today (${plan.date})` +
+      (hiddenUnactivated ? `\n(${hiddenUnactivated} overdue orders were never activated — ignored)` : ''));
+    return;
+  }
+
+  let buffer = `⏰ **Expiry Check — ${shown.length} Orders Due** (${plan.date}; ${plan.summary.remove_overdue} overdue)${by}\n`;
+  const lines = shown.map(r => formatPlanLine(r) + '\n');
+  for (const inv of plan.invalid) {
+    lines.push(`• ⚠️ Order #${inv.orderId} has unparseable expiry_date "${inv.value}" — skipped\n`);
+  }
+  if (hiddenUnactivated) lines.push(`(${hiddenUnactivated} overdue orders were never activated — ignored)\n`);
+
+  for (const line of lines) {
+    if ((buffer + line).length > 1800) {
+      await channel.send(buffer);
+      buffer = '';
+    }
+    buffer += line;
+  }
+  if (buffer.trim()) await channel.send(buffer);
+}
+
+function formatPlanLine(r) {
+  const warn = [];
+  if (r.overdue) warn.push(`overdue ${r.daysOverdue}d`);
+  if (!r.discordId) warn.push('⚠️ no discord_id');
+  if (r.action === 'keep_active_order') warn.push(`kept: active order #${r.activeOrderId}`);
+  if (r.unactivatedRenewalOrderId) warn.push(`⚠️ newer order #${r.unactivatedRenewalOrderId} (same email) not activated`);
+  return `• Order #${r.orderId} | Discord: ${r.discordId || 'N/A'} | Expiry: ${r.expiry}${warn.length ? ' | ' + warn.join(' | ') : ''}`;
+}
+
+async function postKeptMembershipAlert(r) {
+  if (!ADMIN_LOG_CHANNEL_ID || !client.user) return;
+  const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
+  if (!channel?.isTextBased()) return;
+  const embed = new EmbedBuilder()
+    .setColor(0x0099ff)
+    .setTitle('📝 Membership Renewal Detected')
+    .addFields(
+      { name: 'Discord ID', value: `${r.discordId}`, inline: true },
+      { name: 'Expired Order ID', value: `${r.orderId}`, inline: true },
+      { name: 'Active Order ID', value: `${r.activeOrderId}`, inline: true }
+    )
+    .setTimestamp()
+    .setFooter({ text: 'Renewal Alert' });
+  await channel.send({ embeds: [embed] });
+}
+
+// --- /expiry SLASH COMMAND (admin) ---
+//   /expiry check [date]  -> preview only (ephemeral + CSV). Changes nothing.
+//   /expiry run   [date]  -> same preview + Confirm/Cancel buttons. Confirm executes ONLY the
+//                            previewed orders; if that now means more removals than previewed
+//                            (something changed), the cap halts it and nothing is done.
+// Who: users in EXPIRY_ADMIN_USER_IDS / members with a role in EXPIRY_ADMIN_ROLE_IDS (comma-separated)
+// if either is set; otherwise anyone with Manage Roles. PLUS the EXPIRY_COMMAND_KEY, asked in a
+// modal on every use (see below). Confirm must come from the same user within 10 minutes; a
+// pending confirmation is lost if the bot restarts (just run it again).
+const EXPIRY_CONFIRM_TTL_MS = 10 * 60 * 1000;
+const pendingExpiryRuns = new Map(); // nonce -> { userId, date, orderIds, remove, keep, createdAt }
+
+const csvEnv = name => (process.env[name] || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function isExpiryAdmin(interaction) {
+  if (!interaction.inGuild() || interaction.guildId !== process.env.GUILD_ID) return false;
+  const users = csvEnv('EXPIRY_ADMIN_USER_IDS');
+  const roles = csvEnv('EXPIRY_ADMIN_ROLE_IDS');
+  if (users.length || roles.length) {
+    if (users.includes(interaction.user.id)) return true;
+    const memberRoles = interaction.member?.roles;
+    const roleIds = Array.isArray(memberRoles) ? memberRoles : [...(memberRoles?.cache?.keys?.() || [])];
+    return roles.some(r => roleIds.includes(r));
+  }
+  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles));
+}
+
+async function registerAdminCommands() {
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const dateOpt = (o, desc) => o.setName('date').setDescription(desc).setMinLength(10).setMaxLength(10).setRequired(false);
+  const cmd = new SlashCommandBuilder()
+    .setName('expiry')
+    .setDescription('Membership expiry tools (admin)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles)
+    .addSubcommand(s => s.setName('check').setDescription('Preview who would lose the member role. Changes nothing.')
+      .addStringOption(o => dateOpt(o, 'As of date YYYY-MM-DD (default: today, WIB)')))
+    .addSubcommand(s => s.setName('run').setDescription('Preview, then confirm removing expired/overdue members now.')
+      .addStringOption(o => dateOpt(o, 'As of date YYYY-MM-DD, today or earlier (default: today, WIB)')));
+  // create() upserts this one command by name; it does not touch other guild commands.
+  await guild.commands.create(cmd.toJSON());
+  appendBotLog('INFO', 'Registered /expiry slash command', { guildId: guild.id });
+}
+
+function buildPreviewContent(plan, { mode, cap }) {
+  const s = plan.summary;
+  const head = mode === 'run'
+    ? `**Expiry run — preview as of ${plan.date}** (nothing changed yet)`
+    : `**Expiry check — as of ${plan.date}** (dry run, nothing changed)`;
+  const lines = [
+    head,
+    `Remove member role: **${s.remove}** (${s.remove_overdue} overdue)`,
+    `Keep — other active order: **${s.keep_active_order}** (these orders get marked finished)`,
+    `Never activated: ${s.no_discord_id_today} expiring today, ${s.no_discord_id_overdue} overdue (ignored)`,
+  ];
+  if (s.invalid_expiry) lines.push(`⚠️ Unparseable expiry_date: ${s.invalid_expiry} (skipped)`);
+  if (s.flagged_unactivated_renewal) lines.push(`⚠️ ${s.flagged_unactivated_renewal} removal(s) have a newer, unactivated order with the same email`);
+  if (s.remove > cap) lines.push(`⚠️ Above the scheduled-run cap (${cap}): the daily run would halt. A confirmed /expiry run is allowed.`);
+
+  const actionable = plan.results.filter(r => r.action !== 'no_discord_id');
+  if (actionable.length) {
+    lines.push('', `First ${Math.min(10, actionable.length)} of ${actionable.length}:`);
+    for (const r of actionable.slice(0, 10)) lines.push(formatPlanLine(r));
+  }
+  lines.push('', plan.results.length || plan.invalid.length ? 'Full list attached (CSV).' : 'Nothing due.');
+
+  let content = lines.join('\n');
+  if (content.length > 1900) content = content.slice(0, 1890) + '\n…';
+  return content;
+}
+
+// --- Second factor: EXPIRY_COMMAND_KEY ---
+// Every /expiry use asks for the key in a modal (not a command option: options are shown in the
+// command bar and in the "used /expiry" header). Fails closed if the key is missing or < 12 chars.
+// 5 wrong keys within 15 minutes locks that user out for 15 minutes; every wrong key raises a
+// critical alert in the admin log channel. Once the key is accepted, the Confirm button of that same
+// run does not ask again.
+const EXPIRY_KEY_MIN_LENGTH = 12;
+const EXPIRY_KEY_MAX_FAILURES = 5;
+const EXPIRY_KEY_WINDOW_MS = 15 * 60 * 1000;
+const expiryKeyFailures = new Map(); // userId -> { count, firstAt, lockedUntil }
+
+function expiryKeyConfigured() {
+  return (process.env.EXPIRY_COMMAND_KEY || '').length >= EXPIRY_KEY_MIN_LENGTH;
+}
+
+function expiryKeyMatches(input) {
+  const expected = process.env.EXPIRY_COMMAND_KEY || '';
+  if (expected.length < EXPIRY_KEY_MIN_LENGTH) return false;
+  // Hash both sides so the comparison is constant-time regardless of length.
+  const a = createHash('sha256').update(String(input ?? ''), 'utf8').digest();
+  const b = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+function expiryKeyLockedMinutes(userId) {
+  const f = expiryKeyFailures.get(userId);
+  if (!f?.lockedUntil) return 0;
+  const left = f.lockedUntil - Date.now();
+  if (left <= 0) { expiryKeyFailures.delete(userId); return 0; }
+  return Math.ceil(left / 60000);
+}
+
+function recordExpiryKeyFailure(userId) {
+  const now = Date.now();
+  let f = expiryKeyFailures.get(userId);
+  if (!f || now - f.firstAt > EXPIRY_KEY_WINDOW_MS) f = { count: 0, firstAt: now, lockedUntil: 0 };
+  f.count += 1;
+  if (f.count >= EXPIRY_KEY_MAX_FAILURES) f.lockedUntil = now + EXPIRY_KEY_WINDOW_MS;
+  expiryKeyFailures.set(userId, f);
+  return f;
+}
+
+async function handleExpiryCommand(interaction) {
+  if (!isExpiryAdmin(interaction)) {
+    await interaction.reply({ content: 'You are not allowed to use this command.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!expiryKeyConfigured()) {
+    await interaction.reply({ content: `/expiry is disabled: EXPIRY_COMMAND_KEY is not set (or shorter than ${EXPIRY_KEY_MIN_LENGTH} characters) in the bot's .env.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const locked = expiryKeyLockedMinutes(interaction.user.id);
+  if (locked) {
+    await interaction.reply({ content: `Too many wrong keys. Try again in ${locked} minute(s).`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const mode = interaction.options.getSubcommand(); // 'check' | 'run'
+  const date = interaction.options.getString('date') || '';
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    await interaction.reply({ content: 'date must be YYYY-MM-DD.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`expiry-key:${mode}:${date}`)
+    .setTitle(mode === 'run' ? 'Expiry run — admin key' : 'Expiry check — admin key');
+  const input = new TextInputBuilder()
+    .setCustomId('expiry_key')
+    .setLabel('Admin key')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(200);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  await interaction.showModal(modal); // must be the first response to the command
+}
+
+async function handleExpiryKeyModal(interaction) {
+  const [, mode, date] = interaction.customId.split(':');
+  if (!isExpiryAdmin(interaction) || !['check', 'run'].includes(mode)) {
+    await interaction.reply({ content: 'You are not allowed to use this command.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const locked = expiryKeyLockedMinutes(interaction.user.id);
+  if (locked) {
+    await interaction.reply({ content: `Too many wrong keys. Try again in ${locked} minute(s).`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  const key = interaction.fields.getTextInputValue('expiry_key');
+  if (!expiryKeyMatches(key)) {
+    const f = recordExpiryKeyFailure(interaction.user.id);
+    appendBotLog('WARN', '/expiry wrong key', { userId: interaction.user.id, tag: interaction.user.tag, mode, attempts: f.count });
+    await logCritical('/expiry — wrong admin key', { user: `${interaction.user.tag} (${interaction.user.id})`, mode, attemptsInWindow: f.count, lockedOut: Boolean(f.lockedUntil) });
+    await interaction.reply({
+      content: f.lockedUntil ? 'Wrong key. Too many attempts — locked for 15 minutes.' : `Wrong key. ${EXPIRY_KEY_MAX_FAILURES - f.count} attempt(s) left.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  expiryKeyFailures.delete(interaction.user.id);
+
+  await runExpiryPreview(interaction, mode, date || null);
+}
+
+async function runExpiryPreview(interaction, mode, date) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (mode === 'run' && date && date > localTodayIso()) {
+    await interaction.editReply('A live run cannot target a future date. Use `/expiry check` to preview a future day.');
+    return;
+  }
+
+  const preview = await runExpiryCheck({ dryRun: true, date, triggeredBy: interaction.user.tag });
+  if (!preview.success) {
+    await interaction.editReply(`Could not build the preview: ${preview.error}`);
+    return;
+  }
+
+  appendBotLog('INFO', `/expiry ${mode} preview`, { userId: interaction.user.id, date: preview.date, ...preview.summary });
+
+  const files = (preview.results.length || preview.invalid.length)
+    ? [new AttachmentBuilder(Buffer.from(planToCsv(preview), 'utf8'), { name: `expiry-${mode}-${preview.date}.csv` })]
+    : [];
+  const content = buildPreviewContent(preview, { mode, cap: preview.cap });
+
+  const actionable = preview.results.filter(r => r.action === 'remove' || r.action === 'keep_active_order');
+  if (mode === 'check' || actionable.length === 0) {
+    await interaction.editReply({ content, files });
+    return;
+  }
+
+  for (const [k, v] of pendingExpiryRuns) if (Date.now() - v.createdAt > EXPIRY_CONFIRM_TTL_MS) pendingExpiryRuns.delete(k);
+  const nonce = randomUUID();
+  pendingExpiryRuns.set(nonce, {
+    userId: interaction.user.id,
+    date: preview.date,
+    orderIds: actionable.map(r => r.orderId),
+    remove: preview.summary.remove,
+    keep: preview.summary.keep_active_order,
+    createdAt: Date.now(),
+  });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`expiry:confirm:${nonce}`).setStyle(ButtonStyle.Danger)
+      .setLabel(`Confirm: remove ${preview.summary.remove}, keep ${preview.summary.keep_active_order}`),
+    new ButtonBuilder().setCustomId(`expiry:cancel:${nonce}`).setStyle(ButtonStyle.Secondary).setLabel('Cancel')
+  );
+  await interaction.editReply({ content: content + '\n\nConfirm within 10 minutes.', files, components: [row] });
+}
+
+async function handleExpiryButton(interaction) {
+  const [, action, nonce] = interaction.customId.split(':');
+  const pending = pendingExpiryRuns.get(nonce);
+
+  if (!pending || Date.now() - pending.createdAt > EXPIRY_CONFIRM_TTL_MS) {
+    pendingExpiryRuns.delete(nonce);
+    await interaction.update({ content: 'This confirmation expired (or the bot restarted). Run `/expiry run` again.', components: [] });
+    return;
+  }
+  if (interaction.user.id !== pending.userId || !isExpiryAdmin(interaction)) {
+    await interaction.reply({ content: 'Only the admin who started this run can confirm it.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  pendingExpiryRuns.delete(nonce); // single use
+
+  if (action === 'cancel') {
+    await interaction.update({ content: 'Cancelled — nothing was changed.', components: [] });
+    appendBotLog('INFO', '/expiry run cancelled', { userId: interaction.user.id, date: pending.date });
+    return;
+  }
+
+  await interaction.update({ content: `⏳ Running removal for ${pending.date} (${pending.remove} to remove, ${pending.keep} to keep)…`, components: [] });
+
+  const result = await runExpiryCheck({
+    date: pending.date,
+    onlyOrderIds: pending.orderIds,
+    maxRemovals: pending.remove, // more removals than previewed => something changed => halt
+    triggeredBy: `${interaction.user.tag} (${interaction.user.id})`,
+  });
+
+  let msg;
+  if (result.busy) {
+    msg = `Not started: ${result.error}`;
+  } else if (result.halted) {
+    msg = `Not started: the plan changed since your preview (now ${result.wouldRemove} removals vs ${pending.remove} previewed). Nothing was changed — run \`/expiry run\` again.`;
+  } else if (result.error) {
+    msg = `Run failed: ${result.error}`;
+  } else {
+    const t = result.tally || {};
+    msg = [
+      `✅ Expiry run for ${result.date} finished.`,
+      `Removed: ${t.removed || 0} · Already left server: ${t.not_in_guild || 0} · Kept (active order): ${t.kept || 0} · Failed: ${t.failed || 0}`,
+      ...(result.failed || []).slice(0, 10).map(f => `• Failed #${f.orderId} (${f.discordId}): ${f.error}`),
+      (result.failed || []).length ? 'Failed orders stay open and are retried by the next daily run.' : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  // Interaction tokens last 15 minutes; a very large run can outlive it.
+  await interaction.editReply({ content: msg }).catch(() =>
+    appendBotLog('WARN', 'Could not edit /expiry run reply (token expired?)', { result: { success: result.success, tally: result.tally } }));
+}
+
 // Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
-cron.schedule("0 5 * * *", runExpiryCheck);
+cron.schedule("0 5 * * *", () => runExpiryCheck({ triggeredBy: 'cron' }));
 cron.schedule("0 6 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)
@@ -1065,7 +1411,13 @@ app.post('/run-expiry-check', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Unauthorized' });
     }
 
-    const result = await runExpiryCheck();
+    const { dryRun = false, date = null, maxRemovals } = req.body || {};
+    const result = await runExpiryCheck({
+      dryRun: dryRun === true || dryRun === 'true',
+      date,
+      triggeredBy: 'api',
+      ...(maxRemovals !== undefined ? { maxRemovals: parseInt(maxRemovals, 10) } : {}),
+    });
     return res.json(result);
   } catch (e) {
     appendBotLog('ERROR', 'Error in /run-expiry-check endpoint', { error: e.message });
