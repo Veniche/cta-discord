@@ -3,7 +3,7 @@ import vm from 'vm';
 import { fileURLToPath } from 'url';
 const BOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 const plan = await import(BOT + '/expiry-plan.js');
-const { planExpiryRun, executeExpiryPlan, normalizeExpiry, localTodayIso, isExpiredForActivation, markAlreadyWithoutRole } = plan;
+const { planExpiryRun, executeExpiryPlan, normalizeExpiry, localTodayIso, isExpiredForActivation, markAlreadyWithoutRole, limitPlan } = plan;
 
 let fail = 0;
 const check = (label, cond) => { console.log((cond ? 'PASS ' : 'FAIL ') + label); if (!cond) fail++; };
@@ -84,7 +84,7 @@ check('D cron at 05:30 UTC, after expirychecker.py, wraps runExpiryCheck', /cron
 
 class Embed { setColor() { return this } setTitle() { return this } addFields() { return this } setTimestamp() { return this } setFooter() { return this } setDescription() { return this } }
 function sandbox({ wcOrders = [], leftGuild = [], channelOk = true, findResult = null, env = {}, roleHolders = [], finishedFails = false } = {}) {
-  const st = { sent: [], removed: [], finished: [], critical: [], rolesAdded: [], wcUpdates: [], fetches: [], fullFetches: 0, fullFetchFails: false };
+  const st = { sent: [], removed: [], finished: [], critical: [], rolesAdded: [], wcUpdates: [], fetches: [], fullFetches: 0, fullFetchFails: false, daily: {} };
   const cache = new Map(roleHolders.map(h => [h, { user: { id: h }, roles: { cache: { has: r => r === 'MEMBER' } } }]));
   const guild = {
     members: { cache, fetch: async id => {
@@ -98,7 +98,8 @@ function sandbox({ wcOrders = [], leftGuild = [], channelOk = true, findResult =
     } },
   };
   const ctx = {
-    process: { env: { TZ_OFFSET_HOURS: '7', GUILD_ID: 'g', MEMBER_ROLE_ID: 'MEMBER', ...env } }, Date, JSON, Promise, console, Number, parseInt, String, Error,
+    process: { env: { TZ_OFFSET_HOURS: '7', GUILD_ID: 'g', MEMBER_ROLE_ID: 'MEMBER', EXPIRY_DAILY_LIMIT: '0', ...env } }, Date, JSON, Promise, console, Number, parseInt, String, Error, Math, Infinity,
+    readExpiryDailyCount: d => st.daily[d] || 0, addExpiryDailyCount: (d, n) => { st.daily[d] = (st.daily[d] || 0) + n; },
     ADMIN_LOG_CHANNEL_ID: 'admin', ACTIVATION_LOG_CHANNEL_ID: undefined, WEBINAR_LOCK_PATH: 'x',
     ...plan,
     woocommerce: {
@@ -162,6 +163,27 @@ check('I first member download failing -> run stops with an error, nobody remove
 sb = sandbox({ wcOrders: [ord({ id: 42, discord: 'L1', expiry: shift(-1) })], finishedFails: true });
 r = await sb.ctx.runExpiryCheck();
 check('I finished-order fetch failing does not stop the normal run', r.success && sb.st.removed.join() === 'L1');
+
+// J. daily limit (WhatsApp hook): at most N order changes per day, oldest expiry first, rest queued
+const due8 = Array.from({ length: 8 }, (_, i) => ord({ id: 300 + i, discord: 'Q' + i, expiry: shift(-8 + i) }));
+p = limitPlan(planExpiryRun([...due8, ord({ id: 399, expiry: shift(-3) })], TODAY), 5);
+check('J limitPlan keeps the 5 oldest expiries, queues 3, leaves never-activated alone',
+  p.results.filter(x => x.action === 'remove').map(x => x.orderId).join() === '300,301,302,303,304' && p.queued.map(x => x.orderId).join() === '305,306,307' && p.summary.queued === 3 && Boolean(byId(p, 399)));
+check('J limitPlan: Infinity keeps all, 0 keeps none', limitPlan(planExpiryRun(due8, TODAY), Infinity).queued.length === 0 && limitPlan(planExpiryRun(due8, TODAY), 0).results.length === 0);
+sb = sandbox({ wcOrders: due8, env: { EXPIRY_DAILY_LIMIT: '5' } });
+r = await sb.ctx.runExpiryCheck({ dryRun: true });
+check('J dry run reports 5 now / 3 queued, changes nothing', r.daily.todayCount === 5 && r.daily.queuedCount === 3 && sb.st.removed.length === 0);
+r = await sb.ctx.runExpiryCheck();
+check('J live run: 5 oldest removed, 3 queued, count saved', sb.st.removed.join() === 'Q0,Q1,Q2,Q3,Q4' && r.daily.queuedCount === 3 && sb.st.daily[TODAY] === 5);
+check('J admin log says what is queued', sb.st.sent.join('').includes('3 more due, queued for the next day (daily limit 5)'));
+r = await sb.ctx.runExpiryCheck();
+check('J second run the same day: limit used, nobody removed', sb.st.removed.length === 5 && r.daily.todayCount === 0 && r.daily.queuedCount === 8);
+sb.st.daily = {}; // next day
+r = await sb.ctx.runExpiryCheck();
+check('J next day: next 5 by expiry (the mock still lists already-handled orders)', sb.st.removed.length === 10 && r.daily.todayCount === 5);
+sb = sandbox({ wcOrders: [closed({ id: 44, discord: 'K1', expiry: TODAY }), closed({ id: 45, discord: 'K2', expiry: TODAY }), ord({ id: 46, discord: 'K3', expiry: shift(-1) })], roleHolders: ['K1'], env: { EXPIRY_DAILY_LIMIT: '2' } });
+r = await sb.ctx.runExpiryCheck();
+check('J order changes without a removal count toward the limit too', sb.st.finished.length === 2 && sb.st.daily[TODAY] === 2 && r.daily.queuedCount === 1);
 
 // G. activation
 const found = expiry => ({ orderId: 50, order: { meta_data: expiry === undefined ? [] : [{ key: 'expiry_date', value: expiry }], line_items: [] } });

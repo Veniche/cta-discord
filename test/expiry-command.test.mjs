@@ -24,14 +24,15 @@ const src = fs.readFileSync(BOT + '/index.js', 'utf8');
 const glue = src.slice(src.indexOf('// --- AUTO-KICK JOB (runs daily) ---'), src.indexOf('// Schedule daily run'));
 
 function sandbox({ orders = [], env = { EXPIRY_COMMAND_KEY: KEY } } = {}) {
-  const st = { removed: [], finished: [], critical: [], posts: [], registered: null, wcOrders: orders, wcFetches: 0 };
+  const st = { removed: [], finished: [], critical: [], posts: [], registered: null, wcOrders: orders, wcFetches: 0, daily: {} };
   const guild = {
     id: 'G',
     members: { fetch: async id => ({ user: { id, tag: id }, roles: { cache: { has: () => true } } }) },
     commands: { create: async json => { st.registered = json; } },
   };
   const ctx = {
-    process: { env: { TZ_OFFSET_HOURS: '7', GUILD_ID: 'G', ...env } }, Date, JSON, Promise, console, Number, parseInt, String, Error, Map, Set, Buffer, Array, Boolean, Math,
+    process: { env: { TZ_OFFSET_HOURS: '7', GUILD_ID: 'G', EXPIRY_DAILY_LIMIT: '0', ...env } }, Date, JSON, Promise, console, Number, parseInt, String, Error, Map, Set, Buffer, Array, Boolean, Math, Infinity,
+    readExpiryDailyCount: d => st.daily[d] || 0, addExpiryDailyCount: (d, n) => { st.daily[d] = (st.daily[d] || 0) + n; },
     ADMIN_LOG_CHANNEL_ID: 'admin', randomUUID, createHash, timingSafeEqual, ...plan,
     SlashCommandBuilder: discord.SlashCommandBuilder, PermissionFlagsBits: discord.PermissionFlagsBits, MessageFlags: discord.MessageFlags,
     AttachmentBuilder: discord.AttachmentBuilder, ActionRowBuilder: discord.ActionRowBuilder, ButtonBuilder: discord.ButtonBuilder, ButtonStyle: discord.ButtonStyle,
@@ -184,6 +185,19 @@ for (const v of sb.ctx.pendingExpiryRuns.values()) v.createdAt -= 11 * 60 * 1000
 b = btn(nid);
 await sb.ctx.handleExpiryButton(b);
 check('10 confirmation older than 10 min rejected', b.updates[0]?.content.includes('expired') && sb.st.removed.length === 0);
+
+// 11. daily limit in the /expiry run flow
+sb = sandbox({ orders: [ord({ id: 60, discord: 'P1', expiry: shift(-3) }), ord({ id: 61, discord: 'P2', expiry: shift(-2) }), ord({ id: 62, discord: 'P3', expiry: shift(-1) })],
+  env: { EXPIRY_COMMAND_KEY: KEY, EXPIRY_DAILY_LIMIT: '2' } });
+r = await flow(sb, { sub: 'run' });
+e = lastEdit(r.m);
+check('11 preview shows the limit and a confirm for 2 now (1 queued)', e.content.includes('2 can be processed now, 1 queued') && e.components[0].toJSON().components[0].label === 'Confirm: process 2 now (1 queued)');
+b = btn(buttonIds(e)[0]);
+await sb.ctx.handleExpiryButton(b);
+check('11 confirm processes the 2 oldest; result mentions the queue', sb.st.removed.sort().join() === 'P1,P2' && b.edits[0]?.content.includes('1 queued for the next day'));
+sb.st.wcOrders = [sb.st.wcOrders[2]];
+r = await flow(sb, { sub: 'run' });
+check('11 limit used: run shows no confirm button, says tomorrow', buttonIds(lastEdit(r.m)).length === 0 && lastEdit(r.m).content.includes('already used today'));
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exitCode = fail ? 1 : 0;

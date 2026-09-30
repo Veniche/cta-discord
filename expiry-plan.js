@@ -145,6 +145,22 @@ export function restrictPlan(plan, orderIds) {
   return { ...plan, results, invalid: [], summary: summarizeResults(results, 0) };
 }
 
+// Results that change an order (and, for 'remove', the member's roles). Ordering and the daily limit
+// apply to these; 'no_discord_id' changes nothing.
+export const ORDER_CHANGING_ACTIONS = ['remove', 'keep_active_order', 'already_without_role'];
+
+// Keep at most `quota` order-changing results for this run, oldest expiry first; the rest are
+// `queued`. Nothing is lost: queued orders are still completed (or closed without the Discord marker)
+// and come back in the next run. quota = Infinity keeps everything.
+export function limitPlan(plan, quota) {
+  const actionable = plan.results.filter(r => ORDER_CHANGING_ACTIONS.includes(r.action))
+    .sort((a, b) => a.expiry.localeCompare(b.expiry) || a.orderId - b.orderId);
+  const kept = new Set(actionable.slice(0, Math.max(0, quota)).map(r => r.orderId));
+  const results = plan.results.filter(r => !ORDER_CHANGING_ACTIONS.includes(r.action) || kept.has(r.orderId));
+  const queued = actionable.filter(r => !kept.has(r.orderId));
+  return { ...plan, results, queued, summary: { ...summarizeResults(results, plan.invalid.length), queued: queued.length } };
+}
+
 export function planToCsv(plan) {
   const cols = ['order_id', 'action', 'discord_id', 'email', 'expiry', 'days_overdue', 'active_order_id', 'unactivated_renewal_order_id', 'order_already_closed'];
   const esc = v => {

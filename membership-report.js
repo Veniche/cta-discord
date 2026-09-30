@@ -176,14 +176,23 @@ export function membershipFor(discordId, idx) {
 // Admins also give roles by hand (like the webinar codes), and by policy those grants are lifetime. So
 // a server member with no WooCommerce order and no webinar code who holds the member or lifetime role
 // is a manual member: counted as lifetime, and the audit only checks that they hold both roles.
-export function isManualMember(member, ms, { memberRoleId, lifetimeRoleId }) {
+// Members with a manual-terms role (MANUAL_ROLE_IDS, comma-separated) have terms agreed outside
+// WooCommerce: manual whether or not they have orders, and the audit leaves their roles alone. The
+// expiry run still treats their orders normally.
+export const hasManualTermsRole = (member, { manualRoleIds = [] } = {}) => Boolean(member && manualRoleIds.some(r => member.roles.includes(r)));
+
+export function isManualMember(member, ms, roles) {
+  if (hasManualTermsRole(member, roles)) return true;
   if (!member || ms.orders.length || ms.webinar) return false;
-  return member.roles.includes(memberRoleId) || Boolean(lifetimeRoleId && member.roles.includes(lifetimeRoleId));
+  return member.roles.includes(roles.memberRoleId) || Boolean(roles.lifetimeRoleId && member.roles.includes(roles.lifetimeRoleId));
 }
 
-// membershipFor() plus the manual-grant rule, for display (list, find).
+// membershipFor() plus the manual-grant rules, for display (list, find).
 export function describeMembership(ms, member, roles) {
   if (!isManualMember(member, ms, roles)) return ms;
+  if (hasManualTermsRole(member, roles)) {
+    return { ...ms, active: true, kind: 'manual', source: 'manual', manualTerms: true, label: ms.active ? `manual terms (order: ${ms.label})` : 'manual terms' };
+  }
   const hasLifetimeRole = Boolean(roles.lifetimeRoleId && member.roles.includes(roles.lifetimeRoleId));
   return { ...ms, active: true, lifetime: true, kind: 'manual', source: 'manual', label: hasLifetimeRole ? 'lifetime (manual)' : 'manual, no lifetime role' };
 }
@@ -227,7 +236,7 @@ export const formatHints = hints => hints.map(h => `#${h.orderId} (${h.status}${
 // --- /members list ---
 const joinedDay = ms => (ms ? new Date(ms).toISOString().slice(0, 10) : '');
 
-export function buildMembersReport({ members, orders = null, webinarRows = [], memberRoleId, lifetimeRoleId, todayIso }) {
+export function buildMembersReport({ members, orders = null, webinarRows = [], memberRoleId, lifetimeRoleId, manualRoleIds = [], todayIso }) {
   const holders = members.filter(m => !m.bot && memberRoleId && m.roles.includes(memberRoleId));
   const idx = orders ? indexData({ orders, webinarRows, todayIso }) : null;
 
@@ -235,9 +244,10 @@ export function buildMembersReport({ members, orders = null, webinarRows = [], m
     const row = {
       discordId: m.id, username: m.username, displayName: m.displayName, joined: joinedDay(m.joinedAt),
       lifetimeRole: Boolean(lifetimeRoleId && m.roles.includes(lifetimeRoleId)), staff: Boolean(m.staff),
+      manualTermsRole: hasManualTermsRole(m, { manualRoleIds }),
     };
     if (!idx) return row;
-    const ms = describeMembership(membershipFor(m.id, idx), m, { memberRoleId, lifetimeRoleId });
+    const ms = describeMembership(membershipFor(m.id, idx), m, { memberRoleId, lifetimeRoleId, manualRoleIds });
     return {
       ...row,
       membership: ms.label, kind: ms.kind, source: ms.source,
@@ -251,7 +261,8 @@ export function buildMembersReport({ members, orders = null, webinarRows = [], m
   if (idx) {
     const byMembership = {};
     for (const r of rows) {
-      const key = ['dated', 'lifetime', 'manual'].includes(r.kind) ? r.membership : r.kind;
+      const key = r.kind === 'manual' && r.membership.startsWith('manual terms') ? 'manual terms'
+        : ['dated', 'lifetime', 'manual'].includes(r.kind) ? r.membership : r.kind;
       byMembership[key] = (byMembership[key] || 0) + 1;
     }
     summary.byMembership = byMembership;
@@ -260,8 +271,8 @@ export function buildMembersReport({ members, orders = null, webinarRows = [], m
 }
 
 export function membersToCsv(report) {
-  const cols = ['discord_id', 'username', 'display_name', 'joined', 'lifetime_role', 'staff'];
-  const pick = r => [r.discordId, r.username, r.displayName, r.joined, r.lifetimeRole, r.staff];
+  const cols = ['discord_id', 'username', 'display_name', 'joined', 'lifetime_role', 'manual_terms_role', 'staff'];
+  const pick = r => [r.discordId, r.username, r.displayName, r.joined, r.lifetimeRole, r.manualTermsRole, r.staff];
   if (!report.detailed) return toCsv(cols, report.rows.map(pick));
   return toCsv(
     [...cols, 'membership', 'source', 'access_order_id', 'expiry', 'days_left', 'latest_order_id', 'latest_order_status', 'email', 'orders'],
@@ -297,7 +308,8 @@ export const AUDIT_CODES = {
 const CODE_ORDER = Object.keys(AUDIT_CODES);
 const NOT_ACTIVATED_GRACE_DAYS = 3;
 
-export function auditMemberships({ orders, members = null, webinarRows = [], memberRoleId, lifetimeRoleId, todayIso }) {
+export function auditMemberships({ orders, members = null, webinarRows = [], memberRoleId, lifetimeRoleId, manualRoleIds = [], todayIso }) {
+  const roles = { memberRoleId, lifetimeRoleId, manualRoleIds };
   const idx = indexData({ orders, webinarRows, todayIso });
   const findings = [];
   const add = (code, fields, detail) =>
@@ -363,8 +375,9 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
       const staff = m.staff ? ' — staff (Manage Roles)' : '';
 
       // Manual grant (see isManualMember): lifetime by policy, so only the pair of roles is checked.
-      if (isManualMember(m, ms, { memberRoleId, lifetimeRoleId })) {
+      if (isManualMember(m, ms, roles)) {
         manualMembers++;
+        if (hasManualTermsRole(m, roles)) continue; // terms agreed outside WooCommerce: admins check these
         const flagged = (hasMember && !hasLifetime && lifetimeRoleId) || (hasLifetime && !hasMember);
         const hint = flagged ? formatHints(possibleOrdersFor(m, idx)) : '';
         if (hasMember && !hasLifetime && lifetimeRoleId) add('manual_without_lifetime_role', { ...who, hint }, 'no WooCommerce order or webinar code' + staff);
@@ -374,7 +387,12 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
 
       if (hasMember && !ms.active && !explained.has(m.id)) {
         const last = ms.latestOrder; // not manual and no webinar code, so there is at least one order
-        add('role_without_access', who,
+        // A renewal bought before the old order ended is often never activated: it has no discord_id,
+        // only the same billing email (docs/membership-data.md).
+        const emails = new Set(ms.orders.map(v => v.email).filter(Boolean));
+        const renewals = idx.views.filter(v => v.access && !v.activated && !v.discordId && emails.has(v.email));
+        const hint = renewals.map(v => `#${v.id} (${v.status}, ${v.duration.label}, not activated; same billing email — a renewal to link)`).join('; ');
+        add('role_without_access', { ...who, hint },
           `latest order #${last.id} is ${last.status}${last.isOld ? ' (is_old)' : ''}${last.expiry && last.expiry !== 'INVALID' ? `, expiry ${last.expiry}` : ''}` + staff);
       }
       if (ms.active && !hasMember) {
@@ -434,10 +452,10 @@ export function parseFindQuery(query) {
 
 const MAX_SUBJECTS = 3;
 
-export function findMembership(target, { orders, members = [], webinarRows = [], memberRoleId, lifetimeRoleId, todayIso }) {
+export function findMembership(target, { orders, members = [], webinarRows = [], memberRoleId, lifetimeRoleId, manualRoleIds = [], todayIso }) {
   const idx = indexData({ orders, webinarRows, todayIso });
   const memberById = new Map(members.map(m => [m.id, m]));
-  const shown = id => describeMembership(membershipFor(id, idx), memberById.get(id), { memberRoleId, lifetimeRoleId });
+  const shown = id => describeMembership(membershipFor(id, idx), memberById.get(id), { memberRoleId, lifetimeRoleId, manualRoleIds });
   let discordIds = [];
   let unlinked = [];
 
@@ -473,7 +491,7 @@ export function findMembership(target, { orders, members = [], webinarRows = [],
   }
 
   const candidates = discordIds.slice(MAX_SUBJECTS).map(id => candidate(id, memberById.get(id), shown(id), memberRoleId));
-  const audit = auditMemberships({ orders, members, webinarRows, memberRoleId, lifetimeRoleId, todayIso });
+  const audit = auditMemberships({ orders, members, webinarRows, memberRoleId, lifetimeRoleId, manualRoleIds, todayIso });
   const subjects = discordIds.slice(0, MAX_SUBJECTS).map(id => {
     const membership = shown(id);
     const orderIds = new Set(membership.orders.map(v => v.id));
@@ -515,6 +533,7 @@ function membershipLine(ms) {
     const last = ms.latestOrder;
     return `Membership: ❌ **none**${last ? ` — latest order #${last.id} ${last.status}${ms.lastExpiry ? `, last expiry ${ms.lastExpiry}` : ''}` : ' — no orders linked'}`;
   }
+  if (ms.manualTerms) return `Membership: ✅ **${md(ms.label)}** — manual-terms role (agreed outside WooCommerce)`;
   if (ms.kind === 'manual') {
     return `Membership: ${ms.label.startsWith('lifetime') ? '✅' : '⚠️'} **${ms.label}** — no WooCommerce order or webinar code (granted by hand)`;
   }

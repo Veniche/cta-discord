@@ -152,6 +152,29 @@ check('audit: manual member with both roles gets no finding or hint', !audit2.fi
 check('audit csv: possible_order column', R.auditToCsv(audit2).split('\n')[0].endsWith(',possible_order') && R.auditToCsv(audit2).includes('#60 (completed, not activated; billing name matches)'));
 check('find: hint shown under the issue', R.formatFindResult(R.findMembership({ type: 'discord_id', value: 'J' }, data2), { memberRoleId: MR, lifetimeRoleId: LR }).includes('Possible order: #60'));
 
+// ---- renewals found by email; manual-terms role ----
+const data3 = {
+  ...data, manualRoleIds: ['MANUAL', 'MANUAL2'],
+  orders: [...orders,
+    o({ id: 70, discord: 'RN', status: 'finished', old: true, expiry: shift(-200), email: 'rn@x.com' }),   // 3 months, expired
+    o({ id: 71, product: 'CTA Lifetime', email: 'rn@x.com' }),                                           // renewal: same email, never activated
+    o({ id: 72, discord: 'MT2', status: 'finished', old: true, expiry: shift(-90) }),                    // manual terms, expired order
+  ],
+  members: [...members, mem('RN', [MR, LR]), mem('MT1', [MR, 'MANUAL']), mem('MT2', [MR, 'MANUAL2']), mem('MT3', [MR])],
+};
+const audit3 = R.auditMemberships(data3);
+const rn = audit3.findings.find(f => f.code === 'role_without_access' && f.discordId === 'RN');
+check('renewal: role without active order names the unactivated same-email order', rn?.hint.includes('#71') && rn.hint.includes('same billing email'));
+check('manual-terms role, no orders: counted manual, no findings', !audit3.findings.some(f => f.discordId === 'MT1'));
+check('manual-terms role with an expired order: no role finding (admins check these)', !audit3.findings.some(f => f.discordId === 'MT2' && f.code === 'role_without_access'));
+check('without the role, the same case is still flagged', audit3.findings.some(f => f.discordId === 'MT3' && f.code === 'manual_without_lifetime_role'));
+check('manual members counted incl. manual-terms (J, U1, U2, MT1, MT2, MT3)', audit3.manualMembers === 6);
+let txt3 = R.formatFindResult(R.findMembership({ type: 'discord_id', value: 'MT2' }, data3), { memberRoleId: MR, lifetimeRoleId: LR });
+check('find: manual-terms label', txt3.includes('**manual terms**') && txt3.includes('manual-terms role'));
+const rep3 = R.buildMembersReport(data3);
+check('list: manual-terms bucket and CSV column', rep3.summary.byMembership['manual terms'] === 2 && R.membersToCsv(rep3).split('\n')[0].includes('manual_terms_role'));
+check('no MANUAL_ROLE_IDS configured -> the roles mean nothing', R.auditMemberships({ ...data3, manualRoleIds: [] }).findings.some(f => f.discordId === 'MT2' && f.code === 'role_without_access'));
+
 // ---- list ----
 let rep = R.buildMembersReport({ members, memberRoleId: MR, lifetimeRoleId: LR, todayIso: TODAY });
 check('list: member-role holders only, bot excluded', rep.rows.length === 16 && !rep.rows.some(r => r.discordId === 'BOT' || r.discordId === 'N'));

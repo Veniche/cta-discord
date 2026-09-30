@@ -7,7 +7,7 @@ import cron from "node-cron";
 import fs from "fs";
 import path from "path";
 import { WooCommerceService } from "./woocommerce-service.js";
-import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv, markAlreadyWithoutRole, addDaysIso } from "./expiry-plan.js";
+import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv, markAlreadyWithoutRole, addDaysIso, limitPlan, ORDER_CHANGING_ACTIONS } from "./expiry-plan.js";
 import { buildMembersReport, membersToCsv, auditMemberships, auditToCsv, parseFindQuery, findMembership, formatFindResult, md, AUDIT_CODES } from "./membership-report.js";
 
 dotenv.config();
@@ -33,6 +33,29 @@ function appendBotLog(level, message, data = {}) {
     fs.appendFileSync(BOT_LOG_FILE, line);
   } catch (e) {
     console.error('Failed to write bot log:', e.message);
+  }
+}
+
+// --- Daily expiry limit: persisted count of orders changed today ---
+// Every order the expiry run changes fires a WhatsApp hook on the shop, which spammed and got the
+// WhatsApp bot suspended (Sept 2026), so runs are limited per day (EXPIRY_DAILY_LIMIT, see AUTO-KICK
+// JOB). The count is shared by the cron and /expiry run and survives restarts.
+const EXPIRY_STATE_FILE = process.env.EXPIRY_STATE_FILE || path.join(process.cwd(), 'expiry-daily.json');
+
+function readExpiryDailyCount(dateIso) {
+  try {
+    const st = JSON.parse(fs.readFileSync(EXPIRY_STATE_FILE, 'utf8'));
+    return st.date === dateIso ? Number(st.processed) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function addExpiryDailyCount(dateIso, n) {
+  try {
+    fs.writeFileSync(EXPIRY_STATE_FILE, JSON.stringify({ date: dateIso, processed: readExpiryDailyCount(dateIso) + n }));
+  } catch (e) {
+    appendBotLog('ERROR', 'Could not save the daily expiry count (the limit may be exceeded today)', { error: e.message });
   }
 }
 
@@ -1012,7 +1035,14 @@ async function runExpiryReminder() {
 // Safety cap: if a live run would remove more than EXPIRY_MAX_REMOVALS (default 100) members, it
 // removes nobody and raises a critical alert. Nothing is lost — overdue orders are picked up on the
 // next run — so review with a dry run and re-run manually.
+// Daily limit: at most EXPIRY_DAILY_LIMIT (default 5; 0 = no limit) orders are changed per day, cron
+// and /expiry run together, oldest expiry first. The rest stay queued (still due) for the next day.
 const DEFAULT_MAX_REMOVALS = parseInt(process.env.EXPIRY_MAX_REMOVALS || '100', 10);
+const expiryDailyLimit = () => {
+  const n = parseInt(process.env.EXPIRY_DAILY_LIMIT ?? '5', 10);
+  return Number.isFinite(n) && n > 0 ? n : Infinity;
+};
+const isOrderChanging = r => ORDER_CHANGING_ACTIONS.includes(r.action);
 const EXPIRY_RECHECK_DAYS = parseInt(process.env.EXPIRY_RECHECK_DAYS || '7', 10);
 let expiryRunActive = false; // one live run at a time (cron vs manual)
 
@@ -1054,8 +1084,13 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
       appendBotLog('WARN', 'Orders with unparseable expiry_date (skipped)', { invalid: plan.invalid });
     }
 
+    const limit = expiryDailyLimit();
+    const quotaLeft = Math.max(0, limit - readExpiryDailyCount(todayIso));
+    const batch = limitPlan(plan, quotaLeft); // what this run may change today
+    const daily = { limit, quotaLeft, todayCount: batch.results.filter(isOrderChanging).length, queuedCount: batch.queued.length };
+
     if (dryRun) {
-      return { success: true, dryRun: true, cap, wouldHalt: plan.summary.remove > cap, ...plan };
+      return { success: true, dryRun: true, cap, wouldHalt: plan.summary.remove > cap, ...plan, daily };
     }
 
     if (plan.summary.remove > cap) {
@@ -1066,10 +1101,15 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
       return { success: false, halted: true, ...details };
     }
 
+    if (daily.queuedCount) {
+      appendBotLog('INFO', 'Daily expiry limit: rest queued for the next day', { triggeredBy, ...daily });
+    }
+    plan = batch;
+
     const guild = await client.guilds.fetch(process.env.GUILD_ID);
 
     // Admin log is best-effort: a failure here must never skip removals (it used to `return`).
-    await postExpiryAdminLog(plan, triggeredBy).catch(err =>
+    await postExpiryAdminLog(plan, triggeredBy, daily).catch(err =>
       appendBotLog('WARN', 'Failed to send expiring orders log to chat', { error: err.message }));
 
     const outcomes = await executeExpiryPlan(plan, {
@@ -1087,9 +1127,12 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
         appendBotLog('WARN', 'Failed to send renewal alert to Discord', { error: err.message })),
     });
 
+    const changed = outcomes.filter(o => ['removed', 'not_in_guild', 'kept', 'already_without_role'].includes(o.outcome)).length;
+    if (changed) addExpiryDailyCount(todayIso, changed);
+
     const tally = outcomes.reduce((acc, o) => ({ ...acc, [o.outcome]: (acc[o.outcome] || 0) + 1 }), {});
     const failed = outcomes.filter(o => o.outcome === 'failed');
-    return { success: failed.length === 0, date: targetIso, count: plan.results.length, summary: plan.summary, tally, failed };
+    return { success: failed.length === 0, date: targetIso, count: plan.results.length, summary: plan.summary, tally, failed, daily };
   } catch (err) {
     appendBotLog('ERROR', 'Error running expiry job', { error: err.message, triggeredBy });
     await logCritical('Expiry Job Critical Error', { error: err.message, targetIso, triggeredBy });
@@ -1127,7 +1170,7 @@ async function memberRoleHolders() {
   return new Set([...all.values()].filter(m => m.roles.cache.has(process.env.MEMBER_ROLE_ID)).map(m => m.user.id));
 }
 
-async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
+async function postExpiryAdminLog(plan, triggeredBy = 'cron', daily = null) {
   if (!ADMIN_LOG_CHANNEL_ID || !client.user) return;
   const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
   if (!channel?.isTextBased()) {
@@ -1139,8 +1182,13 @@ async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
   const shown = plan.results.filter(r => !(r.action === 'no_discord_id' && r.overdue) && r.action !== 'already_without_role');
   const hiddenUnactivated = plan.results.length - shown.length;
   const by = triggeredBy === 'cron' ? '' : ` — manual run by ${triggeredBy}`;
+  const queuedLine = daily?.queuedCount ? `⏸️ ${daily.queuedCount} more due, queued for the next day (daily limit ${daily.limit})\n` : '';
 
   if (shown.length === 0 && plan.invalid.length === 0) {
+    if (queuedLine) {
+      await channel.send(`⏸️ **Expiry Check**${by}\nDaily limit (${daily.limit}) already used today; ${daily.queuedCount} due order(s) queued for the next day.`);
+      return;
+    }
     await channel.send(`🟢 **Expiry Check**${by}\nNo memberships expiring today (${plan.date})` +
       (hiddenUnactivated ? `\n(${hiddenUnactivated} overdue orders were never activated — ignored)` : ''));
     return;
@@ -1152,6 +1200,7 @@ async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
     lines.push(`• ⚠️ Order #${inv.orderId} has unparseable expiry_date "${inv.value}" — skipped\n`);
   }
   if (hiddenUnactivated) lines.push(`(${hiddenUnactivated} overdue orders were never activated — ignored)\n`);
+  if (queuedLine) lines.push(queuedLine);
 
   for (const line of lines) {
     if ((buffer + line).length > 1800) {
@@ -1249,6 +1298,10 @@ function buildPreviewContent(plan, { mode, cap }) {
   if (s.closed_elsewhere) lines.push(`${s.closed_elsewhere} of the removals: order already closed by the Telegram checker, Discord role still on`);
   if (s.already_without_role) lines.push(`${s.already_without_role} order(s) closed by the Telegram checker whose member no longer has the role (only marked done)`);
   if (s.remove > cap) lines.push(`⚠️ Above the scheduled-run cap (${cap}): the daily run would halt. A confirmed /expiry run is allowed.`);
+  const d = plan.daily;
+  if (d && d.limit !== Infinity && (d.queuedCount || d.quotaLeft < d.limit)) {
+    lines.push(`⏸️ Daily limit ${d.limit} (${d.limit - d.quotaLeft} used today): ${d.todayCount} can be processed now, ${d.queuedCount} queued for the next day`);
+  }
 
   const actionable = plan.results.filter(r => r.action !== 'no_discord_id');
   if (actionable.length) {
@@ -1394,8 +1447,12 @@ async function runExpiryPreview(interaction, mode, date) {
     : [];
   const content = buildPreviewContent(preview, { mode, cap: preview.cap });
 
-  const actionable = preview.results.filter(r => ['remove', 'keep_active_order', 'already_without_role'].includes(r.action));
-  if (mode === 'check' || actionable.length === 0) {
+  const actionable = preview.results.filter(isOrderChanging);
+  if (mode === 'check' || actionable.length === 0 || preview.daily.todayCount === 0) {
+    if (mode === 'run' && actionable.length && preview.daily.todayCount === 0) {
+      await interaction.editReply({ content: content + `\n\nDaily limit (${preview.daily.limit}) already used today — the queued orders run tomorrow.`, files });
+      return;
+    }
     await interaction.editReply({ content, files });
     return;
   }
@@ -1413,7 +1470,9 @@ async function runExpiryPreview(interaction, mode, date) {
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`expiry:confirm:${nonce}`).setStyle(ButtonStyle.Danger)
-      .setLabel(`Confirm: remove ${preview.summary.remove}, keep ${preview.summary.keep_active_order}`),
+      .setLabel(preview.daily.queuedCount
+        ? `Confirm: process ${preview.daily.todayCount} now (${preview.daily.queuedCount} queued)`
+        : `Confirm: remove ${preview.summary.remove}, keep ${preview.summary.keep_active_order}`),
     new ButtonBuilder().setCustomId(`expiry:cancel:${nonce}`).setStyle(ButtonStyle.Secondary).setLabel('Cancel')
   );
   await interaction.editReply({ content: content + '\n\nConfirm within 10 minutes.', files, components: [row] });
@@ -1464,6 +1523,7 @@ async function handleExpiryButton(interaction) {
       `Removed: ${t.removed || 0} · Already left server: ${t.not_in_guild || 0} · Kept (active order): ${t.kept || 0} · Already without role: ${t.already_without_role || 0} · Failed: ${t.failed || 0}`,
       ...(result.failed || []).slice(0, 10).map(f => `• Failed #${f.orderId} (${f.discordId}): ${f.error}`),
       (result.failed || []).length ? 'Failed orders stay open and are retried by the next daily run.' : '',
+      result.daily?.queuedCount ? `⏸️ ${result.daily.queuedCount} queued for the next day (daily limit ${result.daily.limit}).` : '',
     ].filter(Boolean).join('\n');
   }
 
@@ -1605,6 +1665,7 @@ async function runMembersRequest(interaction, req) {
 
   const memberRoleId = process.env.MEMBER_ROLE_ID;
   const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
+  const manualRoleIds = csvEnv('MANUAL_ROLE_IDS'); // manual-terms roles (docs/membership-data.md)
   if (!memberRoleId) {
     await interaction.editReply('MEMBER_ROLE_ID is not set in the bot\'s .env.');
     return;
@@ -1613,13 +1674,13 @@ async function runMembersRequest(interaction, req) {
   const members = await fetchGuildMembersPlain();
 
   if (req.sub === 'list' && !req.detailed) {
-    const report = buildMembersReport({ members, memberRoleId, lifetimeRoleId, todayIso });
+    const report = buildMembersReport({ members, memberRoleId, lifetimeRoleId, manualRoleIds, todayIso });
     await interaction.editReply({ content: formatMembersSummary(report), files: [csvFile(membersToCsv(report), `members-${todayIso}.csv`)], allowedMentions: NO_PINGS });
     return;
   }
 
   const cache = await ordersForMembers();
-  const data = { orders: cache.orders, members, webinarRows: readWebinarCsv(), memberRoleId, lifetimeRoleId, todayIso };
+  const data = { orders: cache.orders, members, webinarRows: readWebinarCsv(), memberRoleId, lifetimeRoleId, manualRoleIds, todayIso };
   const asOf = `\n-# WooCommerce data from ${new Date(cache.at).toISOString().slice(11, 16)} UTC${Date.now() - cache.at > 5000 ? ' (cached)' : ''}`;
 
   if (req.sub === 'list') {
