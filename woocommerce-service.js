@@ -131,14 +131,15 @@ export class WooCommerceService {
 
   // Fetch every order with the given status in one pass (newest first), retrying transient
   // failures (429 / 5xx / network) so one hiccup doesn't abort the daily expiry run.
-  async getAllOrders(status = 'completed') {
+  // `params` adds query filters, e.g. { modified_after: ISO } (ignored by WooCommerce < 5.8).
+  async getAllOrders(status = 'completed', params = {}) {
     const perPage = 100;
     const all = [];
     for (let page = 1; ; page++) {
       let response;
       for (let attempt = 1; ; attempt++) {
         try {
-          response = await this.api.get('orders', { per_page: perPage, page, status, orderby: 'date', order: 'desc' });
+          response = await this.api.get('orders', { per_page: perPage, page, status, orderby: 'date', order: 'desc', ...params });
           break;
         } catch (error) {
           const code = error.response?.status;
@@ -155,7 +156,7 @@ export class WooCommerceService {
       const totalPages = parseInt(response.headers?.['x-wp-totalpages'] || '0', 10);
       if (orders.length < perPage || (totalPages && page >= totalPages)) break;
     }
-    appendWCLog({ event: 'getAllOrders', status, count: all.length });
+    appendWCLog({ event: 'getAllOrders', status, ...params, count: all.length });
     return all;
   }
 
@@ -164,7 +165,8 @@ export class WooCommerceService {
   async getAllOrdersAnyStatus(extraStatuses = ['finished']) {
     const byId = new Map();
     for (const o of await this.getAllOrders('any')) byId.set(o.id, o);
-    for (const status of extraStatuses) {
+    const seen = new Set([...byId.values()].map(o => o.status));
+    for (const status of extraStatuses.filter(st => !seen.has(st))) {
       const orders = await this.getAllOrders(status).catch(error => {
         appendWCLog({ event: 'getAllOrdersAnyStatus.skipped', status, error: error.message });
         return [];
@@ -206,13 +208,15 @@ export class WooCommerceService {
     return matches;
   }
 
-  // Mark an order finished and set is_old meta to true
+  // Mark an order finished, set is_old, and record that its Discord side is done
+  // (discord_role_removed_at: status/is_old are shared with the Telegram expiry checker).
   async markOrderFinished(orderId) {
     try {
       const payload = {
         status: 'finished',
         meta_data: [
-          { key: 'is_old', value: 'True' }
+          { key: 'is_old', value: 'True' },
+          { key: 'discord_role_removed_at', value: new Date().toISOString() }
         ]
       };
       const response = await this.api.put(`orders/${orderId}`, payload);

@@ -7,7 +7,7 @@ import cron from "node-cron";
 import fs from "fs";
 import path from "path";
 import { WooCommerceService } from "./woocommerce-service.js";
-import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv } from "./expiry-plan.js";
+import { planExpiryRun, executeExpiryPlan, localTodayIso, isExpiredForActivation, normalizeExpiry, restrictPlan, planToCsv, markAlreadyWithoutRole, addDaysIso } from "./expiry-plan.js";
 import { buildMembersReport, membersToCsv, auditMemberships, auditToCsv, parseFindQuery, findMembership, formatFindResult, md, AUDIT_CODES } from "./membership-report.js";
 
 dotenv.config();
@@ -55,6 +55,13 @@ async function logCritical(title, details = {}) {
     appendBotLog('ERROR', 'Failed to send critical alert to Discord', { error: e.message });
   }
 }
+
+// A promise rejection nobody handled (e.g. a Discord 403 on a send) must not take the whole bot down —
+// Node exits on them by default, which silently dropped every run and command in flight.
+process.on('unhandledRejection', err => {
+  console.error('Unhandled rejection:', err);
+  appendBotLog('ERROR', 'Unhandled promise rejection', { error: err?.message || String(err), code: err?.code, url: err?.url });
+});
 
 const client = new Client({
   intents: [
@@ -615,7 +622,7 @@ client.on("guildMemberAdd", async (member) => {
     try {
       const welcomeChannel = await member.guild.channels.fetch(process.env.WELCOME_CHANNEL_ID);
       if (welcomeChannel?.isTextBased()) {
-        welcomeChannel.send(`👋 Welcome ${member.user}, thanks for joining!`);
+        await welcomeChannel.send(`👋 Welcome ${member.user}, thanks for joining!`); // awaited: a rejection here used to crash the bot
       }
     } catch (e) {
       appendBotLog('WARN', 'Could not send welcome message', { error: e.message });
@@ -990,7 +997,10 @@ async function runExpiryReminder() {
 
 // --- AUTO-KICK JOB (runs daily) ---
 // Removes the member role for every completed, non-old order whose expiry_date is today OR
-// earlier (overdue orders from a missed run are caught up automatically).
+// earlier (overdue orders from a missed run are caught up automatically), and for orders that
+// expirychecker.py (the Telegram remover, root crontab 05:00 UTC) already closed in the last
+// EXPIRY_RECHECK_DAYS days while the member still has the role. Runs at 05:30 UTC, after it: whichever
+// job closes an order first (finished + is_old) makes the other skip it.
 //
 // Triggers: daily cron, POST /run-expiry-check, and the /expiry slash command (check | run).
 // Options:
@@ -999,10 +1009,11 @@ async function runExpiryReminder() {
 //   maxRemovals: N          raise the safety cap for a one-off catch-up run
 //   onlyOrderIds: [...]     execute only these orders (what an admin previewed in Discord)
 //   triggeredBy: string     shown in logs / admin channel
-// Safety cap: if a live run would remove more than EXPIRY_MAX_REMOVALS (default 30) members, it
+// Safety cap: if a live run would remove more than EXPIRY_MAX_REMOVALS (default 100) members, it
 // removes nobody and raises a critical alert. Nothing is lost — overdue orders are picked up on the
 // next run — so review with a dry run and re-run manually.
-const DEFAULT_MAX_REMOVALS = parseInt(process.env.EXPIRY_MAX_REMOVALS || '30', 10);
+const DEFAULT_MAX_REMOVALS = parseInt(process.env.EXPIRY_MAX_REMOVALS || '100', 10);
+const EXPIRY_RECHECK_DAYS = parseInt(process.env.EXPIRY_RECHECK_DAYS || '7', 10);
 let expiryRunActive = false; // one live run at a time (cron vs manual)
 
 async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAULT_MAX_REMOVALS, onlyOrderIds = null, triggeredBy = 'cron' } = {}) {
@@ -1024,10 +1035,19 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
   if (!dryRun) expiryRunActive = true;
 
   try {
-    // One fetch for the whole run (was: a full scan of every order per expiring order).
-    const orders = await woocommerce.getAllOrders('completed');
-    let plan = planExpiryRun(orders, targetIso);
+    // One fetch for the whole run (was: a full scan of every order per expiring order), plus finished
+    // orders changed recently — the ones the Telegram checker closes. There are thousands of old
+    // finished orders, so only recently modified ones are fetched.
+    const completed = await woocommerce.getAllOrders('completed');
+    const recentlyFinished = await woocommerce.getAllOrders('finished', { modified_after: addDaysIso(targetIso, -(EXPIRY_RECHECK_DAYS + 1)) + 'T00:00:00' })
+      .catch(err => { appendBotLog('WARN', 'Could not fetch finished orders; closed-elsewhere check skipped', { error: err.message }); return []; });
+    const orders = [...new Map([...completed, ...recentlyFinished].map(o => [o.id, o])).values()];
+    let plan = planExpiryRun(orders, targetIso, { recheckDays: EXPIRY_RECHECK_DAYS });
     if (onlyOrderIds) plan = restrictPlan(plan, onlyOrderIds);
+    if (plan.results.some(r => r.closedElsewhere)) {
+      const holders = await memberRoleHolders();
+      plan = markAlreadyWithoutRole(plan, id => holders.has(id));
+    }
     appendBotLog('INFO', `Found ${plan.results.length} orders due (expiry on/before ${targetIso})`, { dryRun, triggeredBy, ...plan.summary });
 
     if (plan.invalid.length) {
@@ -1079,6 +1099,13 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
   }
 }
 
+// Discord IDs holding the member role right now (one guild member fetch).
+async function memberRoleHolders() {
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const all = await guild.members.fetch();
+  return new Set([...all.values()].filter(m => m.roles.cache.has(process.env.MEMBER_ROLE_ID)).map(m => m.user.id));
+}
+
 async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
   if (!ADMIN_LOG_CHANNEL_ID || !client.user) return;
   const channel = await client.channels.fetch(ADMIN_LOG_CHANNEL_ID).catch(() => null);
@@ -1088,7 +1115,7 @@ async function postExpiryAdminLog(plan, triggeredBy = 'cron') {
   }
 
   // Overdue never-activated orders have no role to remove and would repeat every day — count only.
-  const shown = plan.results.filter(r => !(r.action === 'no_discord_id' && r.overdue));
+  const shown = plan.results.filter(r => !(r.action === 'no_discord_id' && r.overdue) && r.action !== 'already_without_role');
   const hiddenUnactivated = plan.results.length - shown.length;
   const by = triggeredBy === 'cron' ? '' : ` — manual run by ${triggeredBy}`;
 
@@ -1121,6 +1148,7 @@ function formatPlanLine(r) {
   if (!r.discordId) warn.push('⚠️ no discord_id');
   if (r.action === 'keep_active_order') warn.push(`kept: active order #${r.activeOrderId}`);
   if (r.unactivatedRenewalOrderId) warn.push(`⚠️ newer order #${r.unactivatedRenewalOrderId} (same email) not activated`);
+  if (r.closedElsewhere) warn.push('order already closed (Telegram checker)');
   return `• Order #${r.orderId} | Discord: ${r.discordId || 'N/A'} | Expiry: ${r.expiry}${warn.length ? ' | ' + warn.join(' | ') : ''}`;
 }
 
@@ -1197,6 +1225,8 @@ function buildPreviewContent(plan, { mode, cap }) {
   ];
   if (s.invalid_expiry) lines.push(`⚠️ Unparseable expiry_date: ${s.invalid_expiry} (skipped)`);
   if (s.flagged_unactivated_renewal) lines.push(`⚠️ ${s.flagged_unactivated_renewal} removal(s) have a newer, unactivated order with the same email`);
+  if (s.closed_elsewhere) lines.push(`${s.closed_elsewhere} of the removals: order already closed by the Telegram checker, Discord role still on`);
+  if (s.already_without_role) lines.push(`${s.already_without_role} order(s) closed by the Telegram checker whose member no longer has the role (only marked done)`);
   if (s.remove > cap) lines.push(`⚠️ Above the scheduled-run cap (${cap}): the daily run would halt. A confirmed /expiry run is allowed.`);
 
   const actionable = plan.results.filter(r => r.action !== 'no_discord_id');
@@ -1264,21 +1294,6 @@ async function refuseWrongKey(interaction, command, mode) {
   });
 }
 
-// After a correct key, the read-only /members commands stop asking for ADMIN_KEY_UNLOCK_MINUTES
-// (default 10; 0 = ask every time). /expiry always asks, since `run` removes members.
-const adminKeyUnlocks = new Map(); // userId -> unlocked until (ms)
-const adminKeyUnlockMs = () => Math.max(0, parseInt(process.env.ADMIN_KEY_UNLOCK_MINUTES || '10', 10) || 0) * 60 * 1000;
-
-function grantAdminKeyUnlock(userId) {
-  const ms = adminKeyUnlockMs();
-  if (ms) adminKeyUnlocks.set(userId, Date.now() + ms);
-}
-
-function adminKeyUnlocked(userId) {
-  if ((adminKeyUnlocks.get(userId) || 0) > Date.now()) return true;
-  adminKeyUnlocks.delete(userId);
-  return false;
-}
 
 async function handleExpiryCommand(interaction) {
   if (!isExpiryAdmin(interaction)) {
@@ -1333,7 +1348,6 @@ async function handleExpiryKeyModal(interaction) {
     return;
   }
   expiryKeyFailures.delete(interaction.user.id);
-  grantAdminKeyUnlock(interaction.user.id);
 
   await runExpiryPreview(interaction, mode, date || null);
 }
@@ -1359,7 +1373,7 @@ async function runExpiryPreview(interaction, mode, date) {
     : [];
   const content = buildPreviewContent(preview, { mode, cap: preview.cap });
 
-  const actionable = preview.results.filter(r => r.action === 'remove' || r.action === 'keep_active_order');
+  const actionable = preview.results.filter(r => ['remove', 'keep_active_order', 'already_without_role'].includes(r.action));
   if (mode === 'check' || actionable.length === 0) {
     await interaction.editReply({ content, files });
     return;
@@ -1426,7 +1440,7 @@ async function handleExpiryButton(interaction) {
     const t = result.tally || {};
     msg = [
       `✅ Expiry run for ${result.date} finished.`,
-      `Removed: ${t.removed || 0} · Already left server: ${t.not_in_guild || 0} · Kept (active order): ${t.kept || 0} · Failed: ${t.failed || 0}`,
+      `Removed: ${t.removed || 0} · Already left server: ${t.not_in_guild || 0} · Kept (active order): ${t.kept || 0} · Already without role: ${t.already_without_role || 0} · Failed: ${t.failed || 0}`,
       ...(result.failed || []).slice(0, 10).map(f => `• Failed #${f.orderId} (${f.discordId}): ${f.error}`),
       (result.failed || []).length ? 'Failed orders stay open and are retried by the next daily run.' : '',
     ].filter(Boolean).join('\n');
@@ -1443,8 +1457,9 @@ async function handleExpiryButton(interaction) {
 //   /members find user|query   one person by @user, Discord ID, username, email or order number:
 //                              roles, linked orders, whether they have a membership, and any issues.
 //   /members audit             orders and roles that disagree (AUDIT_CODES in membership-report.js). CSV.
-// Same gate as /expiry (isExpiryAdmin + EXPIRY_COMMAND_KEY in a modal); a correct key is remembered for
-// ADMIN_KEY_UNLOCK_MINUTES. Nothing here writes to Discord or WooCommerce.
+// Same gate as /expiry: isExpiryAdmin + EXPIRY_COMMAND_KEY in a modal on every use. Order data is
+// cached for MEMBERS_CACHE_MINUTES (default 5) — there are ~7,500 orders and a full fetch takes a
+// minute or two. Nothing here writes to Discord or WooCommerce.
 const MEMBERS_REQUEST_TTL_MS = 10 * 60 * 1000;
 const pendingMembersRequests = new Map(); // nonce -> { userId, sub, detailed, targetUserId, query, createdAt }
 const NO_PINGS = { parse: [] }; // replies quote user-controlled names
@@ -1491,10 +1506,6 @@ async function handleMembersCommand(interaction) {
     await interaction.reply({ content: 'Give a `user` or a `query` (Discord ID, username, email or order number).', flags: MessageFlags.Ephemeral });
     return;
   }
-  if (adminKeyUnlocked(interaction.user.id)) {
-    await runMembersRequest(interaction, request);
-    return;
-  }
 
   // The request waits server-side; the modal only carries a nonce (custom IDs are capped at 100 chars).
   for (const [k, v] of pendingMembersRequests) if (Date.now() - v.createdAt > MEMBERS_REQUEST_TTL_MS) pendingMembersRequests.delete(k);
@@ -1538,7 +1549,6 @@ async function handleMembersKeyModal(interaction) {
     return;
   }
   pendingMembersRequests.delete(nonce); // single use
-  grantAdminKeyUnlock(interaction.user.id);
   await runMembersRequest(interaction, pending);
 }
 
@@ -1554,6 +1564,15 @@ async function fetchGuildMembersPlain(guild) {
     roles: [...m.roles.cache.keys()],
     staff: Boolean(m.permissions?.has(PermissionFlagsBits.ManageRoles)),
   }));
+}
+
+let membersOrderCache = null; // { at, orders }
+
+async function ordersForMembers() {
+  const ttl = Math.max(0, parseInt(process.env.MEMBERS_CACHE_MINUTES || '5', 10) || 0) * 60 * 1000;
+  if (membersOrderCache && Date.now() - membersOrderCache.at < ttl) return membersOrderCache;
+  membersOrderCache = { at: Date.now(), orders: await woocommerce.getAllOrdersAnyStatus() };
+  return membersOrderCache;
 }
 
 const csvFile = (text, name) => new AttachmentBuilder(Buffer.from(text, 'utf8'), { name });
@@ -1579,20 +1598,22 @@ async function runMembersRequest(interaction, req) {
     return;
   }
 
-  const data = { orders: await woocommerce.getAllOrdersAnyStatus(), members, webinarRows: readWebinarCsv(), memberRoleId, lifetimeRoleId, todayIso };
+  const cache = await ordersForMembers();
+  const data = { orders: cache.orders, members, webinarRows: readWebinarCsv(), memberRoleId, lifetimeRoleId, todayIso };
+  const asOf = `\n-# WooCommerce data from ${new Date(cache.at).toISOString().slice(11, 16)} UTC${Date.now() - cache.at > 5000 ? ' (cached)' : ''}`;
 
   if (req.sub === 'list') {
     const report = buildMembersReport(data);
-    await interaction.editReply({ content: formatMembersSummary(report), files: [csvFile(membersToCsv(report), `members-detailed-${todayIso}.csv`)], allowedMentions: NO_PINGS });
+    await interaction.editReply({ content: formatMembersSummary(report) + asOf, files: [csvFile(membersToCsv(report), `members-detailed-${todayIso}.csv`)], allowedMentions: NO_PINGS });
   } else if (req.sub === 'audit') {
     const audit = auditMemberships(data);
     appendBotLog('INFO', '/members audit result', { userId: interaction.user.id, counts: Object.fromEntries(audit.summary.map(s => [s.code, s.count])) });
     const files = audit.findings.length ? [csvFile(auditToCsv(audit), `members-audit-${todayIso}.csv`)] : [];
-    await interaction.editReply({ content: formatAuditSummary(audit), files, allowedMentions: NO_PINGS });
+    await interaction.editReply({ content: clipMessage(formatAuditSummary(audit) + asOf, 1990), files, allowedMentions: NO_PINGS });
   } else {
     const target = req.targetUserId ? { type: 'discord_id', value: req.targetUserId } : parseFindQuery(req.query);
     const result = findMembership(target, data);
-    await interaction.editReply({ content: formatFindResult(result, { memberRoleId, lifetimeRoleId }), allowedMentions: NO_PINGS });
+    await interaction.editReply({ content: formatFindResult(result, { memberRoleId, lifetimeRoleId }) + asOf, allowedMentions: NO_PINGS });
   }
 }
 
@@ -1630,8 +1651,8 @@ function formatAuditSummary(audit) {
   return clipMessage(lines.join('\n'));
 }
 
-// Schedule daily run (default: 5:00 AM UTC; for UTC+7, that's 12:00 PM)
-cron.schedule("0 5 * * *", () => runExpiryCheck({ triggeredBy: 'cron' }));
+// Schedule daily run: 05:30 UTC (12:30 WIB), after expirychecker.py (05:00 UTC) — see AUTO-KICK JOB.
+cron.schedule("30 5 * * *", () => runExpiryCheck({ triggeredBy: 'cron' }));
 cron.schedule("0 6 * * *", runExpiryReminder);
 
 // Temporary test API to run expiry check on demand (protected)

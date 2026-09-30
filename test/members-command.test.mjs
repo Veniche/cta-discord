@@ -118,29 +118,28 @@ check('4 audit: ephemeral reply', r.m.deferFlags === discord.MessageFlags.Epheme
 check('4 audit: summary + CSV, mentions disabled', e.content.includes('Membership audit') && e.content.includes('Member role, but no active order') &&
   csvLines(e) >= 2 && e.allowedMentions?.parse?.length === 0);
 
-// 5. unlock window: same user skips the key; other users and /expiry still ask
+// 5. the key is asked on every use — no unlock window after a correct key (from /members or /expiry)
 const c2 = cmd({ sub: 'find', user: 'A' });
 await sb.ctx.handleMembersCommand(c2);
-check('5 unlocked: next /members runs without a modal', !c2.modal && c2.deferred && last(c2).content.includes('**3 months**'));
-const other = cmd({ sub: 'audit', userId: 'OTHER' });
-await sb.ctx.handleMembersCommand(other);
-check('5 unlock is per user', Boolean(other.modal));
-const ex = Object.assign(base({}), { options: { getSubcommand: () => 'check', getString: () => null } });
-await sb.ctx.handleExpiryCommand(ex);
-check('5 /expiry still asks for the key while unlocked', Boolean(ex.modal));
-
-sb = sandbox({ env: { ADMIN_KEY_UNLOCK_MINUTES: '0' } });
-await flow(sb, { sub: 'audit' });
-r = await flow(sb, { sub: 'audit' }, 'wrong-key-000000');
-check('5 ADMIN_KEY_UNLOCK_MINUTES=0 -> asks every time', Boolean(r.c.modal));
-
+check('5 right after a correct key, the next /members asks again', Boolean(c2.modal) && !c2.deferred);
 sb = sandbox();
 const exc = Object.assign(base({}), { options: { getSubcommand: () => 'check', getString: () => null } });
 await sb.ctx.handleExpiryCommand(exc);
 await sb.ctx.handleExpiryKeyModal(modalSubmit(exc.modal.custom_id, KEY));
 const after = cmd({ sub: 'list' });
 await sb.ctx.handleMembersCommand(after);
-check('5 a correct /expiry key also unlocks /members', !after.modal && after.deferred);
+check('5 a correct /expiry key does not unlock /members', Boolean(after.modal) && !after.deferred);
+check('5 no unlock setting left in the code', !src.includes('ADMIN_KEY_UNLOCK'));
+
+// 5b. order data is cached for a few minutes (a full fetch is ~7,500 orders); key still asked each time
+sb = sandbox();
+await flow(sb, { sub: 'audit' });
+r = await flow(sb, { sub: 'find', user: 'A' });
+check('5b second command within the cache window: key asked, WooCommerce not re-read', Boolean(r.c.modal) && r.m.deferred && sb.st.wcFetches === 1);
+sb = sandbox({ env: { MEMBERS_CACHE_MINUTES: '0' } });
+await flow(sb, { sub: 'audit' });
+await flow(sb, { sub: 'audit' });
+check('5b MEMBERS_CACHE_MINUTES=0 -> fresh fetch every time', sb.st.wcFetches === 2);
 
 // 6. wrong keys share the /expiry lockout
 sb = sandbox();
@@ -174,15 +173,15 @@ check('7 a request runs once', m.replies[0]?.content.includes('expired'));
 sb = sandbox();
 r = await flow(sb, { sub: 'list' });
 check('8 list: 2 role holders, CSV, WooCommerce not read', last(r.m).content.includes('member role: 2') && csvLines(last(r.m)) === 3 && sb.st.wcFetches === 0);
-c = cmd({ sub: 'list', detailed: true });
-await sb.ctx.handleMembersCommand(c);
-check('8 list detailed: membership buckets + detailed CSV', sb.st.wcFetches === 1 && last(c).content.includes('3 months: 1') &&
-  last(c).files[0].name.startsWith('members-detailed-') && last(c).files[0].attachment.toString().split('\n')[0].includes('membership'));
+r = await flow(sb, { sub: 'list', detailed: true });
+let e8 = last(r.m);
+check('8 list detailed: membership buckets + detailed CSV + data time', sb.st.wcFetches === 1 && e8.content.includes('3 months: 1') && e8.content.includes('WooCommerce data from') &&
+  e8.files[0].name.startsWith('members-detailed-') && e8.files[0].attachment.toString().split('\n')[0].includes('membership'));
 
 // 9. find by query
-c = cmd({ sub: 'find', query: 'u2@x.com' });
-await sb.ctx.handleMembersCommand(c);
-check('9 find by email -> G, no membership, issue listed', last(c).content.includes('`G`') && last(c).content.includes('**none**') && last(c).content.includes('no active order'));
+r = await flow(sb, { sub: 'find', query: 'u2@x.com' });
+e8 = last(r.m);
+check('9 find by email -> G, no membership, issue listed; served from cache', e8.content.includes('`G`') && e8.content.includes('**none**') && e8.content.includes('no active order') && sb.st.wcFetches === 1);
 
 console.log(fail ? `\n${fail} FAILED` : '\nALL PASSED');
 process.exitCode = fail ? 1 : 0;

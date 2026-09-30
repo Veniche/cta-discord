@@ -3,6 +3,11 @@
 
 const metaOf = (order, key) => (order.meta_data || []).find(m => m.key === key)?.value;
 
+// Set when the Discord side of an order is done (role removed, member gone, or kept by a renewal).
+// status finished + is_old is shared with expirychecker.py (the Telegram remover), so it can't say that.
+export const DISCORD_HANDLED_META = 'discord_role_removed_at';
+export const isDiscordHandled = order => Boolean(metaOf(order, DISCORD_HANDLED_META));
+
 export function isOldOrder(order) {
   const v = metaOf(order, 'is_old');
   return v === true || ['true', '1'].includes(String(v ?? '').toLowerCase());
@@ -32,6 +37,7 @@ export function isExpiredForActivation(expiryValue, todayIso) {
 }
 
 const daysBetween = (fromIso, toIso) => Math.round((Date.parse(toIso) - Date.parse(fromIso)) / 86400000);
+export const addDaysIso = (iso, n) => new Date(Date.parse(iso) + n * 86400000).toISOString().slice(0, 10);
 
 /**
  * Decide what the expiry job should do on `targetIso` (YYYY-MM-DD, local date).
@@ -40,11 +46,18 @@ const daysBetween = (fromIso, toIso) => Math.round((Date.parse(toIso) - Date.par
  * day the bot missed (downtime, crash, API outage) is caught up on the next run instead of being
  * skipped forever. Orders are marked `finished` + is_old once handled, so they drop out.
  *
+ * Also picks up orders someone else already closed (finished / is_old) while their Discord role is
+ * still on: expirychecker.py kicks Telegram members at 05:00 UTC and marks the orders it handles
+ * finished + is_old, so the Discord run (05:30 UTC) would otherwise never see them. Limited to
+ * expiries in the last `recheckDays` days and to orders not yet marked DISCORD_HANDLED_META.
+ *
  * "Still active" = another completed, non-old order with no expiry (lifetime / not set) or an
  * expiry AFTER the target date.
  */
-export function planExpiryRun(orders, targetIso) {
+export function planExpiryRun(orders, targetIso, { recheckDays = 7 } = {}) {
   const live = orders.filter(o => o.status === 'completed' && !isOldOrder(o));
+  const liveIds = new Set(live.map(o => o.id));
+  const since = addDaysIso(targetIso, -recheckDays);
 
   const stillActive = o => {
     const exp = normalizeExpiry(metaOf(o, 'expiry_date'));
@@ -59,14 +72,20 @@ export function planExpiryRun(orders, targetIso) {
     const raw = metaOf(o, 'expiry_date');
     const exp = normalizeExpiry(raw);
     if (exp === 'INVALID') invalid.push({ orderId: o.id, value: raw });
-    else if (exp !== null && exp <= targetIso) due.push({ o, exp });
+    else if (exp !== null && exp <= targetIso) due.push({ o, exp, closedElsewhere: false });
+  }
+  for (const o of orders) {
+    if (liveIds.has(o.id) || isDiscordHandled(o) || !metaOf(o, 'discord_id')) continue;
+    if (o.status !== 'finished' && !isOldOrder(o)) continue;
+    const exp = normalizeExpiry(metaOf(o, 'expiry_date'));
+    if (exp && exp !== 'INVALID' && exp <= targetIso && exp >= since) due.push({ o, exp, closedElsewhere: true });
   }
 
-  const results = due.map(({ o, exp }) => {
+  const results = due.map(({ o, exp, closedElsewhere }) => {
     const discordId = metaOf(o, 'discord_id') ? String(metaOf(o, 'discord_id')) : null;
     const email = emailOf(o);
     const daysOverdue = daysBetween(exp, targetIso);
-    const base = { orderId: o.id, discordId, email, expiry: exp, overdue: daysOverdue > 0, daysOverdue };
+    const base = { orderId: o.id, discordId, email, expiry: exp, overdue: daysOverdue > 0, daysOverdue, closedElsewhere };
 
     // Never activated: no role to remove. Left untouched (admin can still extend it); activation
     // itself now refuses expired codes.
@@ -104,7 +123,18 @@ export function summarizeResults(results, invalidCount = 0) {
     no_discord_id_overdue: count('no_discord_id', r => r.overdue),
     invalid_expiry: invalidCount,
     flagged_unactivated_renewal: results.filter(r => r.unactivatedRenewalOrderId).length,
+    closed_elsewhere: results.filter(r => r.closedElsewhere && r.action === 'remove').length,
+    already_without_role: count('already_without_role'),
   };
+}
+
+// Closed-elsewhere orders whose member no longer holds the member role (the Telegram checker's order
+// was already handled on Discord, an admin took the role, or they left): nothing to remove, only
+// record that the Discord side is done. `hasRole(discordId)` comes from a fresh guild member fetch.
+export function markAlreadyWithoutRole(plan, hasRole) {
+  const results = plan.results.map(r =>
+    r.closedElsewhere && r.action === 'remove' && !hasRole(r.discordId) ? { ...r, action: 'already_without_role' } : r);
+  return { ...plan, results, summary: summarizeResults(results, plan.invalid.length) };
 }
 
 // Keep only the orders a human previewed. A fresh plan is still computed at execution time, so an
@@ -116,13 +146,13 @@ export function restrictPlan(plan, orderIds) {
 }
 
 export function planToCsv(plan) {
-  const cols = ['order_id', 'action', 'discord_id', 'email', 'expiry', 'days_overdue', 'active_order_id', 'unactivated_renewal_order_id'];
+  const cols = ['order_id', 'action', 'discord_id', 'email', 'expiry', 'days_overdue', 'active_order_id', 'unactivated_renewal_order_id', 'order_already_closed'];
   const esc = v => {
     const s = v === null || v === undefined ? '' : String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const rows = plan.results.map(r => [r.orderId, r.action, r.discordId, r.email, r.expiry, r.daysOverdue, r.activeOrderId, r.unactivatedRenewalOrderId]);
-  for (const inv of plan.invalid || []) rows.push([inv.orderId, 'invalid_expiry', '', '', inv.value, '', '', '']);
+  const rows = plan.results.map(r => [r.orderId, r.action, r.discordId, r.email, r.expiry, r.daysOverdue, r.activeOrderId, r.unactivatedRenewalOrderId, r.closedElsewhere ? 'yes' : '']);
+  for (const inv of plan.invalid || []) rows.push([inv.orderId, 'invalid_expiry', '', '', inv.value, '', '', '', '']);
   return [cols, ...rows].map(row => row.map(esc).join(',')).join('\n') + '\n';
 }
 
@@ -138,6 +168,13 @@ export async function executeExpiryPlan(plan, deps) {
       if (r.action === 'no_discord_id') {
         if (!r.overdue) deps.log('WARN', 'Order expiring but no discord_id meta', { orderId: r.orderId });
         outcomes.push({ ...r, outcome: 'skipped' });
+        continue;
+      }
+
+      if (r.action === 'already_without_role') {
+        await deps.markOrderFinished(r.orderId).catch(err =>
+          deps.log('ERROR', 'Failed to mark closed order as handled on Discord', { orderId: r.orderId, discordId: r.discordId, error: err.message }));
+        outcomes.push({ ...r, outcome: 'already_without_role' });
         continue;
       }
 
