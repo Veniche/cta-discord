@@ -1099,10 +1099,31 @@ async function runExpiryCheck({ dryRun = false, date = null, maxRemovals = DEFAU
   }
 }
 
-// Discord IDs holding the member role right now (one guild member fetch).
-async function memberRoleHolders() {
+// Every guild member. A full fetch goes over the gateway and Discord rate-limits it: a second fetch a
+// few seconds after the first (preview, then Confirm) never answered and failed after 2 minutes with
+// "Members didn't arrive in time". With the GuildMembers intent the cache is kept current by join /
+// leave / role-update events, so a full fetch runs at most every MEMBERS_REFRESH_MS and a failed
+// refresh falls back to the cache.
+const MEMBERS_REFRESH_MS = 10 * 60 * 1000;
+let guildMembersFetchedAt = 0;
+
+async function guildMembers() {
   const guild = await client.guilds.fetch(process.env.GUILD_ID);
-  const all = await guild.members.fetch();
+  if (Date.now() - guildMembersFetchedAt > MEMBERS_REFRESH_MS) {
+    try {
+      await guild.members.fetch({ time: 60_000 });
+      guildMembersFetchedAt = Date.now();
+    } catch (err) {
+      if (!guildMembersFetchedAt) throw err; // never had a full list: the cache can't be trusted
+      appendBotLog('WARN', 'Guild member refresh failed; using the cached member list', { error: err.message });
+    }
+  }
+  return guild.members.cache;
+}
+
+// Discord IDs holding the member role right now.
+async function memberRoleHolders() {
+  const all = await guildMembers();
   return new Set([...all.values()].filter(m => m.roles.cache.has(process.env.MEMBER_ROLE_ID)).map(m => m.user.id));
 }
 
@@ -1552,8 +1573,8 @@ async function handleMembersKeyModal(interaction) {
   await runMembersRequest(interaction, pending);
 }
 
-async function fetchGuildMembersPlain(guild) {
-  const all = await guild.members.fetch(); // needs the GuildMembers intent (enabled above)
+async function fetchGuildMembersPlain() {
+  const all = await guildMembers(); // needs the GuildMembers intent (enabled above)
   return [...all.values()].map(m => ({
     id: m.user.id,
     username: m.user.username,
@@ -1589,8 +1610,7 @@ async function runMembersRequest(interaction, req) {
     return;
   }
   const todayIso = localTodayIso();
-  const guild = await client.guilds.fetch(process.env.GUILD_ID);
-  const members = await fetchGuildMembersPlain(guild);
+  const members = await fetchGuildMembersPlain();
 
   if (req.sub === 'list' && !req.detailed) {
     const report = buildMembersReport({ members, memberRoleId, lifetimeRoleId, todayIso });

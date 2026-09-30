@@ -84,10 +84,15 @@ check('D cron at 05:30 UTC, after expirychecker.py, wraps runExpiryCheck', /cron
 
 class Embed { setColor() { return this } setTitle() { return this } addFields() { return this } setTimestamp() { return this } setFooter() { return this } setDescription() { return this } }
 function sandbox({ wcOrders = [], leftGuild = [], channelOk = true, findResult = null, env = {}, roleHolders = [], finishedFails = false } = {}) {
-  const st = { sent: [], removed: [], finished: [], critical: [], rolesAdded: [], wcUpdates: [], fetches: [] };
+  const st = { sent: [], removed: [], finished: [], critical: [], rolesAdded: [], wcUpdates: [], fetches: [], fullFetches: 0, fullFetchFails: false };
+  const cache = new Map(roleHolders.map(h => [h, { user: { id: h }, roles: { cache: { has: r => r === 'MEMBER' } } }]));
   const guild = {
-    members: { fetch: async id => {
-      if (id === undefined) return new Map(roleHolders.map(h => [h, { user: { id: h }, roles: { cache: { has: r => r === 'MEMBER' } } }]));
+    members: { cache, fetch: async id => {
+      if (id === undefined || typeof id === 'object') { // full fetch (gateway)
+        st.fullFetches++;
+        if (st.fullFetchFails) throw new Error("Members didn't arrive in time.");
+        return cache;
+      }
       if (leftGuild.includes(id)) { const e = new Error('Unknown Member'); e.code = 10007; throw e; }
       return { user: { id, tag: id }, roles: { add: async r => st.rolesAdded.push(r), cache: { has: () => true } } };
     } },
@@ -112,7 +117,7 @@ function sandbox({ wcOrders = [], leftGuild = [], channelOk = true, findResult =
     acquireLock: async () => {}, releaseLock: () => {}, readWebinarCsv: () => [], writeWebinarCsv: () => {},
   };
   vm.createContext(ctx);
-  vm.runInContext(expiryGlue + activationGlue + '\n;this.runExpiryCheck = runExpiryCheck; this.activate = activateOrderForDiscordUser;', ctx);
+  vm.runInContext(expiryGlue + activationGlue + '\n;this.runExpiryCheck = runExpiryCheck; this.activate = activateOrderForDiscordUser; this.ageMemberList = () => { guildMembersFetchedAt = 1; };', ctx);
   return { ctx, st };
 }
 
@@ -144,6 +149,16 @@ check('I dry run: 1 removal (role still on), 1 already without role, nothing cha
 check('I finished orders fetched with modified_after (not all 5,000)', sb.st.fetches.some(([st, p]) => st === 'finished' && /^\d{4}-\d{2}-\d{2}T00:00:00$/.test(p?.modified_after || '')));
 r = await sb.ctx.runExpiryCheck();
 check('I live run: role removed for H1, both orders marked done', sb.st.removed.join() === 'H1' && sb.st.finished.sort().join() === '40,41' && r.tally.removed === 1 && r.tally.already_without_role === 1);
+check('I preview + confirm download the member list once (a second full fetch is rate-limited by Discord)', sb.st.fullFetches === 1);
+sb.ctx.ageMemberList();
+sb.st.fullFetchFails = true;
+sb.st.removed.length = 0;
+r = await sb.ctx.runExpiryCheck({ dryRun: true });
+check('I stale member list + failed refresh -> cached list used, run still works', r.success && r.summary.remove === 1 && r.summary.already_without_role === 1 && sb.st.fullFetches === 2);
+sb = sandbox({ wcOrders: [closed({ id: 43, discord: 'H3', expiry: TODAY })], roleHolders: ['H3'] });
+sb.st.fullFetchFails = true;
+r = await sb.ctx.runExpiryCheck();
+check('I first member download failing -> run stops with an error, nobody removed', !r.success && /arrive in time/.test(r.error) && sb.st.removed.length === 0 && sb.st.finished.length === 0);
 sb = sandbox({ wcOrders: [ord({ id: 42, discord: 'L1', expiry: shift(-1) })], finishedFails: true });
 r = await sb.ctx.runExpiryCheck();
 check('I finished-order fetch failing does not stop the normal run', r.success && sb.st.removed.join() === 'L1');

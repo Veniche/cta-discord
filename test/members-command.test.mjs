@@ -33,7 +33,10 @@ function sandbox({ env = {} } = {}) {
     members: [gm('A', ['MEMBER']), gm('G', ['MEMBER'])] };
   const guild = {
     id: 'G',
-    members: { fetch: async id => (id ? null : (st.memberFetches++, new Map(st.members.map(m => [m.user.id, m])))) },
+    members: {
+      get cache() { return new Map(st.members.map(m => [m.user.id, m])); },
+      fetch: async arg => (typeof arg === 'string' ? null : (st.memberFetches++, this?.cache)),
+    },
     commands: { create: async json => { st.registered.push(json); } },
   };
   const ctx = {
@@ -140,6 +143,7 @@ sb = sandbox({ env: { MEMBERS_CACHE_MINUTES: '0' } });
 await flow(sb, { sub: 'audit' });
 await flow(sb, { sub: 'audit' });
 check('5b MEMBERS_CACHE_MINUTES=0 -> fresh fetch every time', sb.st.wcFetches === 2);
+check('5b Discord member list downloaded once for both commands', sb.st.memberFetches === 1);
 
 // 6. wrong keys share the /expiry lockout
 sb = sandbox();
