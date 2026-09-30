@@ -14,6 +14,12 @@ export class WooCommerceService {
       consumerSecret: process.env.WC_CONSUMER_SECRET,
       version: 'wc/v3'
     });
+    // The shop's LiteSpeed Cache serves authenticated REST GETs from cache (x-litespeed-cache: hit,private),
+    // so a read could return an order as it was before a recent write (a claimed activation code looking
+    // unclaimed, a restored order still finished). WooCommerce ignores unknown query parameters, so a
+    // unique one makes every read a cache miss.
+    const get = this.api.get.bind(this.api);
+    this.api.get = (endpoint, params = {}) => get(endpoint, { ...params, _nocache: `${Date.now()}${Math.random().toString(36).slice(2, 8)}` });
   }
 
   async getOrdersTotal() {
