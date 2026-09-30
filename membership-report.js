@@ -388,7 +388,7 @@ export function auditMemberships({ orders, members = null, webinarRows = [], mem
       if (hasMember && !ms.active && !explained.has(m.id)) {
         const last = ms.latestOrder; // not manual and no webinar code, so there is at least one order
         // A renewal bought before the old order ended is often never activated: it has no discord_id,
-        // only the same billing email (docs/membership-data.md).
+        // only the same billing email.
         const emails = new Set(ms.orders.map(v => v.email).filter(Boolean));
         const renewals = idx.views.filter(v => v.access && !v.activated && !v.discordId && emails.has(v.email));
         const hint = renewals.map(v => `#${v.id} (${v.status}, ${v.duration.label}, not activated; same billing email — a renewal to link)`).join('; ');

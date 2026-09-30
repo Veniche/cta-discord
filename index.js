@@ -1665,7 +1665,7 @@ async function runMembersRequest(interaction, req) {
 
   const memberRoleId = process.env.MEMBER_ROLE_ID;
   const lifetimeRoleId = process.env.LIFETIME_ROLE_ID;
-  const manualRoleIds = csvEnv('MANUAL_ROLE_IDS'); // manual-terms roles (docs/membership-data.md)
+  const manualRoleIds = csvEnv('MANUAL_ROLE_IDS'); // manual-terms roles: terms agreed outside WooCommerce
   if (!memberRoleId) {
     await interaction.editReply('MEMBER_ROLE_ID is not set in the bot\'s .env.');
     return;

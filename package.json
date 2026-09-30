@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node --watch index.js",
-    "test": "node test/expiry.test.mjs && node test/expiry-command.test.mjs && node test/members.test.mjs && node test/members-command.test.mjs && node test/restore.test.mjs"
+    "test": "node test/expiry.test.mjs && node test/expiry-command.test.mjs && node test/members.test.mjs && node test/members-command.test.mjs && node test/woocommerce-service.test.mjs"
   },
   "keywords": [],
   "author": "",
