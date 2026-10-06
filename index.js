@@ -339,7 +339,9 @@ async function activateOrderForDiscordUser(uuid, discordUser) {
   }
 }
 
-// Post a persistent activation message with a button to the configured activation channel
+// Post a persistent activation message with a button to the configured activation channel.
+// Unset ACTIVATION_CHANNEL_ID to stop this and the temporary "submitted a code" notice; buttons on an
+// already-posted message keep working, since they're handled by customId, not by channel.
 async function postActivationMessage() {
   if (!process.env.ACTIVATION_CHANNEL_ID) return;
   try {
@@ -641,8 +643,8 @@ client.on("guildMemberAdd", async (member) => {
       appendBotLog('WARN', 'Could not log to audit channel', { error: e.message });
     }
 
-    // Send welcome message (best-effort)
-    try {
+    // Send welcome message (best-effort; unset WELCOME_CHANNEL_ID to disable)
+    if (process.env.WELCOME_CHANNEL_ID) try {
       const welcomeChannel = await member.guild.channels.fetch(process.env.WELCOME_CHANNEL_ID);
       if (welcomeChannel?.isTextBased()) {
         await welcomeChannel.send(`👋 Welcome ${member.user}, thanks for joining!`); // awaited: a rejection here used to crash the bot
